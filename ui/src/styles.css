@@ -1,0 +1,245 @@
+/* clipkeep design tokens — one source of truth for both views.
+   Neutral grays, a single accent, restrained radii/shadows; adapts to light and dark. */
+:root {
+  --bg: #f6f6f7;
+  --surface: #ffffff;
+  --surface-2: #fbfbfc;
+  --elevated: #ffffff;
+  --border: rgba(0, 0, 0, 0.07);
+  --border-strong: rgba(0, 0, 0, 0.12);
+  --divider: #cbd1da;
+  --text: #1a1a1c;
+  --text-2: #55555b;
+  --muted: #686b73;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.1);
+  --selected: rgba(37, 99, 235, 0.08);
+  --hover: rgba(0, 0, 0, 0.04);
+  --star: #e3a008;
+  --pin: #0f8a74;
+  --danger: #d64541;
+  --danger-soft: rgba(214, 69, 65, 0.12);
+  --ok: #0f8a74;
+
+  --r-sm: 6px;
+  --r-md: 9px;
+  --r-lg: 13px;
+  --r-pill: 999px;
+  --shadow-pop: 0 10px 30px -8px rgba(0, 0, 0, 0.28), 0 2px 6px rgba(0, 0, 0, 0.1);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, "Microsoft YaHei UI", sans-serif;
+  font-size: var(--fs-md);
+  color-scheme: light dark;
+}
+
+/* data-theme is set by initTheme/applyTheme in api.ts; "system" resolves to one of these. */
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #1b1b1e;
+  --surface: #26262a;
+  --surface-2: #202023;
+  --elevated: #2e2e33;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --divider: #44464e;
+  --text: #f2f2f4;
+  --text-2: #c4c4ca;
+  --muted: #aaaeb8;
+  --accent: #6aa5ff;
+  --accent-soft: rgba(106, 165, 255, 0.14);
+  --selected: rgba(106, 165, 255, 0.12);
+  --hover: rgba(255, 255, 255, 0.05);
+  --star: #f0b429;
+  --pin: #4fd1b5;
+  --danger: #f27a76;
+  --danger-soft: rgba(242, 122, 118, 0.16);
+  --ok: #4fd1b5;
+  --shadow-pop: 0 12px 34px -8px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+body {
+  overflow: hidden;
+  background: transparent;
+  color: var(--text);
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+button {
+  font: inherit;
+  color: inherit;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+}
+svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+input,
+select,
+textarea {
+  font: inherit;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+  background-clip: padding-box;
+}
+
+kbd {
+  font: inherit;
+  font-size: var(--fs-xs);
+  padding: 1px 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-2);
+}
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  transition: background 0.14s var(--ease), color 0.14s var(--ease);
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.icon-btn.on {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.icon-btn:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Shared desktop menu language for the tray and clip actions. */
+.menu-surface {
+  padding: 4px;
+  background: var(--elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+}
+.menu-label {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+.menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  text-align: left;
+  white-space: nowrap;
+}
+.menu-row > svg { width: 14px; height: 14px; color: var(--text-2); }
+.menu-row:hover,
+.menu-row:focus-visible { background: var(--accent-soft); color: var(--accent); }
+.menu-row:hover > svg,
+.menu-row:focus-visible > svg { color: var(--accent); }
+.menu-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.menu-row:disabled { opacity: .55; cursor: default; }
+.menu-row:disabled:hover { background: none; color: var(--text); }
+.menu-row.danger { color: var(--danger); }
+.menu-row.danger > svg { color: var(--danger); }
+.menu-row.danger:hover,
+.menu-row.danger:focus-visible { background: var(--danger-soft); color: var(--danger); }
+.menu-row.danger:hover > svg,
+.menu-row.danger:focus-visible > svg { color: var(--danger); }
+.menu-row.dim:disabled { color: var(--muted); opacity: .7; }
+.menu-row.primary > svg { color: var(--accent); }
+.menu-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.menu-shortcut { margin-left: auto; flex: none; color: var(--muted); font-size: var(--fs-xs); }
+.menu-row > .menu-chevron { margin-left: auto; width: 11px; height: 11px; }
+.menu-divider { height: 1px; margin: 3px 6px; background: var(--divider); }
+
+/* The whole app sits in one rounded, bordered card so the frameless window reads as a panel. */
+.shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.switch {
+  appearance: none;
+  flex-shrink: 0;
+  width: 38px;
+  height: 20px;
+  border-radius: var(--r-pill);
+  background: var(--border-strong);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.16s var(--ease);
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.16s var(--ease);
+}
+.switch:checked {
+  background: var(--accent);
+}
+.switch:checked::after {
+  transform: translateX(18px);
+}

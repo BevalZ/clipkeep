@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+release
+*.local
+*.exe
+*.msi
+*.msix
+
+# Local clipboard data, backups, and pairing credentials
+*.ckbak
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+lan.json
+settings.json
+*.json.bad
+hotkey-diagnostics.enabled
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Internal reviews and forum drafts stay local
+docs/
