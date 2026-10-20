@@ -55,6 +55,8 @@ export interface LanPeer {
 
 export interface LanState {
   receiveEnabled: boolean;
+  copyReceived: boolean;
+  autoSend: string | null;
   localCodes: { address: string; code: string }[];
   peers: LanPeer[];
 }
@@ -69,6 +71,8 @@ export const api = {
   getCapturePaused: () => invoke<boolean>("get_capture_paused"),
   toggleCapturePaused: () => invoke<boolean>("toggle_capture_paused"),
   getLanState: () => invoke<LanState>("get_lan_state"),
+  setLanAutoSend: (address: string | null) => invoke<LanState>("set_lan_auto_send", { address }),
+  setLanCopyReceived: (enabled: boolean) => invoke<LanState>("set_lan_copy_received", { enabled }),
   setLanReceive: (enabled: boolean) => invoke<LanState>("set_lan_receive", { enabled }),
   addLanPeer: (name: string, code: string) => invoke<LanState>("add_lan_peer", { name, code }),
   removeLanPeer: (address: string) => invoke<LanState>("remove_lan_peer", { address }),

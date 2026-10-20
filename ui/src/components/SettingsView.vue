@@ -129,6 +129,15 @@ async function addPeer() {
   if (!error.value) { peerName.value = ""; peerCode.value = ""; }
 }
 
+function changeAutoSend(event: Event) {
+  const address = (event.target as HTMLSelectElement).value;
+  lanAction(() => api.setLanAutoSend(address || null));
+}
+
+function toggleLanCopy() {
+  if (lan.value) lanAction(() => api.setLanCopyReceived(!lan.value!.copyReceived));
+}
+
 function toggleLanReceive() {
   if (lan.value) lanAction(() => api.setLanReceive(!lan.value!.receiveEnabled));
 }
@@ -346,15 +355,25 @@ onUnmounted(() => {
       <div v-if="lan" class="card">
         <label class="row">
           <div class="label">
-            <div class="name">接收其他设备的文本</div>
-            <div class="desc">默认关闭。开启后，同一局域网内持有配对码的设备可手动发送文本，收到后只存入本机历史，不覆盖当前剪贴板。</div>
+            <div class="name">接收其他设备的文本和图片</div>
+            <div class="desc">默认关闭。开启后，同一 Wi-Fi 或 Tailnet 内持有配对码的设备可发送文本和图片，默认只存入历史；可在下方开启收到后复制。</div>
           </div>
           <input type="checkbox" class="switch" :checked="lan.receiveEnabled" :disabled="lanBusy" @change="toggleLanReceive" />
+        </label>
+        <label class="row">
+          <div class="label"><div class="name">收到后复制到剪贴板</div><div class="desc">文本和图片自动进入系统剪贴板，随后可在其他应用粘贴。不会模拟按键，也不会回传收到的内容。</div></div>
+          <input type="checkbox" class="switch" :checked="lan.copyReceived" :disabled="lanBusy" @change="toggleLanCopy" />
+        </label>
+        <label class="row">
+          <div class="label"><div class="name">本机复制后自动发送</div><div class="desc">默认关闭，仅发送本机新复制的文本和图片；连续复制时优先同步最新内容。收到的内容不回传，发送失败不自动重试。</div></div>
+          <select :value="lan.autoSend || ''" :disabled="lanBusy" @change="changeAutoSend">
+            <option value="">关闭</option><option v-for="peer in lan.peers" :key="peer.address" :value="peer.address">{{ peer.name }}</option>
+          </select>
         </label>
         <div v-if="lan.receiveEnabled" class="row lan-code-row">
           <div class="label">
             <div class="name">本机配对码</div>
-            <div class="desc">在另一台设备的 clipkeep 中添加；请通过可信方式传递。端口 45788，首次接收可能需要允许系统防火墙访问。</div>
+            <div class="desc">在另一台设备的 clipkeep 中添加；请通过可信方式传递。TCP/UDP 端口 45788，首次接收可能需要允许系统防火墙访问。安卓可扫描发现；输入本机配对码后可建立双向配对。</div>
           </div>
           <div v-if="lan.localCodes.length" class="lan-addresses">
             <button v-for="item in lan.localCodes" :key="item.address" class="btn" @click="copyCode(item.address)">复制 {{ item.address }}</button>

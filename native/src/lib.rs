@@ -176,12 +176,15 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
     }
     let core = app.state::<Core>();
     let result = match captured {
-        Captured::Text(text) => core.save_text(&text, None),
+        Captured::Text(text) => core
+            .save_text(&text, None)
+            .map(|()| core.lan.queue_local(app, db::text_hash(&text))),
         Captured::Image(img) => {
             let hash = images::hash(&img);
             core.images
                 .write(&img, &hash)
                 .and_then(|saved| core.save_image(&saved, None))
+                .map(|()| core.lan.queue_local(app, hash))
         }
         #[cfg(windows)]
         Captured::ImageFiles(paths) => {
@@ -208,6 +211,7 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
                         core.images
                             .write(&img, &hash)
                             .and_then(|saved| core.save_image(&saved, source.as_deref()))
+                            .map(|()| core.lan.queue_local(&app, hash))
                     });
                     match result {
                         Ok(()) => saved_any = true,
@@ -309,6 +313,16 @@ fn set_lan_receive(app: AppHandle, core: State<Core>, enabled: bool) -> CmdResul
 }
 
 #[tauri::command]
+fn set_lan_auto_send(core: State<Core>, address: Option<String>) -> CmdResult<lan::LanState> {
+    core.lan.set_auto_send(address)
+}
+
+#[tauri::command]
+fn set_lan_copy_received(core: State<Core>, enabled: bool) -> CmdResult<lan::LanState> {
+    core.lan.set_copy_received(enabled)
+}
+
+#[tauri::command]
 fn add_lan_peer(core: State<Core>, name: String, code: String) -> CmdResult<lan::LanState> {
     core.lan.add_peer(&name, &code)
 }
@@ -340,16 +354,33 @@ fn copy_lan_code(core: State<Core>, address: String) -> CmdResult<()> {
 async fn send_clip_to_peer(app: AppHandle, id: i64, address: String) -> CmdResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
         let core = app.state::<Core>();
-        let (kind, text) = db::get(&*core.conn()?, id)
-            .map_err(to_err)?
-            .ok_or("条目不存在")?;
-        if kind != db::KIND_TEXT {
-            return Err("仅支持传送文本".into());
-        }
-        core.lan.send_text(&address, &text)
+        send_stored_clip(&core, id, &address)
     })
     .await
     .map_err(to_err)?
+}
+
+fn send_stored_clip(core: &Core, id: i64, address: &str) -> CmdResult<()> {
+    let _send = lan::SEND_WORK.lock().map_err(to_err)?;
+    let (kind, text) = db::get(&*core.conn()?, id)
+        .map_err(to_err)?
+        .ok_or("条目不存在")?;
+    if kind == db::KIND_TEXT {
+        core.lan.send_text(address, &text)
+    } else {
+        let png = core
+            .images
+            .png_bytes_limited(&text, lan_wire::MAX_IMAGE_BYTES)
+            .map_err(to_err)?;
+        let (w, h) =
+            image::ImageReader::with_format(std::io::Cursor::new(&png), image::ImageFormat::Png)
+                .into_dimensions()
+                .map_err(to_err)?;
+        if u64::from(w) * u64::from(h) > lan_wire::MAX_IMAGE_PIXELS {
+            return Err("传送图片最多 1600 万像素".into());
+        }
+        core.lan.send_image(address, &png)
+    }
 }
 
 #[tauri::command]
@@ -1369,6 +1400,8 @@ pub fn run() {
             toggle_capture_paused,
             get_lan_state,
             set_lan_receive,
+            set_lan_copy_received,
+            set_lan_auto_send,
             add_lan_peer,
             remove_lan_peer,
             rotate_lan_code,

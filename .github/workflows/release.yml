@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Create the version tag and publish a public release after all builds pass
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -114,6 +119,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: ${{ inputs.publish }}
     needs: [version, desktop, android]
     runs-on: ubuntu-latest
     permissions:

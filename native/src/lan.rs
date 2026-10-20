@@ -1,12 +1,16 @@
-//! Small, opt-in, one-way text transfer over the local network.
+//! Opt-in text/image transfer and authenticated return pairing over LAN or Tailnet.
 //! The receive code contains a random key; possession of that code authorizes sending.
 
-use crate::lan_wire::{encrypt_frame, make_ack, read_text_frame, verify_ack};
-use crate::{Core, changed, clipboard};
+#[cfg(test)]
+use crate::lan_wire::read_text_frame;
+use crate::lan_wire::{
+    self, Message, allowed_ip, encrypt_frame, encrypt_payload, make_ack, read_message, verify_ack,
+};
+use crate::{Core, changed};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +19,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const PORT: u16 = 45788;
+pub static SEND_WORK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 use crate::lan_wire::MAX_CIPHER_BYTES;
 const CODE_PREFIX: &str = "cklan1://";
@@ -31,6 +36,10 @@ struct Peer {
 #[serde(rename_all = "camelCase")]
 struct Config {
     receive_enabled: bool,
+    #[serde(default)]
+    copy_received: bool,
+    #[serde(default)]
+    auto_send: Option<String>,
     receive_key: String,
     peers: Vec<Peer>,
 }
@@ -41,6 +50,8 @@ impl Config {
         getrandom::fill(&mut key).expect("Windows secure random source unavailable");
         Self {
             receive_enabled: false,
+            copy_received: false,
+            auto_send: None,
             receive_key: URL_SAFE_NO_PAD.encode(key),
             peers: Vec::new(),
         }
@@ -65,6 +76,8 @@ pub struct LocalCode {
 #[serde(rename_all = "camelCase")]
 pub struct LanState {
     pub receive_enabled: bool,
+    pub copy_received: bool,
+    pub auto_send: Option<String>,
     pub local_codes: Vec<LocalCode>,
     pub peers: Vec<PeerView>,
 }
@@ -72,6 +85,7 @@ pub struct LanState {
 struct Worker {
     stop: Arc<AtomicBool>,
     join: JoinHandle<()>,
+    discovery: JoinHandle<()>,
 }
 
 pub struct LanService {
@@ -79,15 +93,12 @@ pub struct LanService {
     config: Mutex<Config>,
     operation: Mutex<()>,
     worker: Mutex<Option<Worker>>,
+    sync_queue: Mutex<(bool, Option<String>)>,
 }
 
 fn decode_key(encoded: &str) -> Result<[u8; 32], String> {
     let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| "配对码无效")?;
     bytes.try_into().map_err(|_| "配对码无效".into())
-}
-
-fn allowed_ip(ip: Ipv4Addr) -> bool {
-    ip.is_private() || ip.is_link_local() || ip.is_loopback()
 }
 
 fn parse_code(code: &str) -> Result<(SocketAddrV4, String), String> {
@@ -98,7 +109,7 @@ fn parse_code(code: &str) -> Result<(SocketAddrV4, String), String> {
     let (address, key) = body.split_once('/').ok_or("配对码格式无效")?;
     let address: SocketAddrV4 = address.parse().map_err(|_| "配对地址无效")?;
     if !allowed_ip(*address.ip()) || address.port() != PORT {
-        return Err("仅支持本地网络 IPv4 地址和默认端口".into());
+        return Err("仅支持局域网或 Tailnet IPv4 地址和默认端口".into());
     }
     decode_key(key)?;
     Ok((address, key.to_owned()))
@@ -131,6 +142,7 @@ impl LanService {
             config: Mutex::new(config),
             operation: Mutex::new(()),
             worker: Mutex::new(None),
+            sync_queue: Mutex::new((false, None)),
         }
     }
 
@@ -148,6 +160,8 @@ impl LanService {
         ips.dedup();
         Ok(LanState {
             receive_enabled: config.receive_enabled,
+            copy_received: config.copy_received,
+            auto_send: config.auto_send.clone(),
             local_codes: ips
                 .into_iter()
                 .map(|ip| {
@@ -185,11 +199,21 @@ impl LanService {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT))
             .map_err(|e| format!("无法监听端口 {PORT}：{e}"))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PORT))
+            .map_err(|e| format!("无法监听发现端口：{e}"))?;
+        udp.set_read_timeout(Some(Duration::from_millis(300)))
+            .map_err(|e| e.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
+        let discovery_stop = stop.clone();
+        let discovery = thread::spawn(move || discovery_loop(udp, discovery_stop));
         let thread_stop = stop.clone();
         let app = app.clone();
         let join = thread::spawn(move || receive_loop(listener, key, app, thread_stop));
-        *self.worker.lock().map_err(|e| e.to_string())? = Some(Worker { stop, join });
+        *self.worker.lock().map_err(|e| e.to_string())? = Some(Worker {
+            stop,
+            join,
+            discovery,
+        });
         Ok(())
     }
 
@@ -197,6 +221,7 @@ impl LanService {
         if let Some(worker) = self.worker.lock().map_err(|e| e.to_string())?.take() {
             worker.stop.store(true, Ordering::SeqCst);
             let _ = worker.join.join();
+            let _ = worker.discovery.join();
         }
         Ok(())
     }
@@ -225,8 +250,85 @@ impl LanService {
         self.state()
     }
 
-    pub fn add_peer(&self, name: &str, code: &str) -> Result<LanState, String> {
+    pub fn set_auto_send(&self, address: Option<String>) -> Result<LanState, String> {
         let _guard = self.operation.lock().map_err(|e| e.to_string())?;
+        let mut config = self.config.lock().map_err(|e| e.to_string())?.clone();
+        if let Some(ref address) = address
+            && !config.peers.iter().any(|p| &p.address == address)
+        {
+            return Err("设备未配对".into());
+        }
+        config.auto_send = address;
+        save(&self.path, &config)?;
+        *self.config.lock().map_err(|e| e.to_string())? = config;
+        self.state()
+    }
+    // Latest clipboard wins during a burst. Queue stores a hash, never image/text buffers.
+    pub fn queue_local(&self, app: &AppHandle, hash: String) {
+        if !self.config.lock().is_ok_and(|c| c.auto_send.is_some()) {
+            return;
+        }
+        let Ok(mut queue) = self.sync_queue.lock() else {
+            return;
+        };
+        queue.1 = Some(hash);
+        if queue.0 {
+            return;
+        }
+        queue.0 = true;
+        let app = app.clone();
+        thread::spawn(move || {
+            let core = app.state::<Core>();
+            loop {
+                let hash = {
+                    let Ok(mut queue) = core.lan.sync_queue.lock() else {
+                        return;
+                    };
+                    match queue.1.take() {
+                        Some(hash) => hash,
+                        None => {
+                            queue.0 = false;
+                            return;
+                        }
+                    }
+                };
+                let address = core
+                    .lan
+                    .config
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.auto_send.clone());
+                let Some(address) = address else { continue };
+                let id = core.conn().ok().and_then(|db| {
+                    db.query_row("SELECT id FROM clips WHERE hash=?1", [&hash], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .ok()
+                });
+                if let Some(id) = id
+                    && let Err(error) = crate::send_stored_clip(&core, id, &address)
+                {
+                    eprintln!("Clipboard sync failed: {error}");
+                    let _ = app.emit("lan-sync-error", error);
+                }
+            }
+        });
+    }
+
+    pub fn set_copy_received(&self, enabled: bool) -> Result<LanState, String> {
+        let _guard = self.operation.lock().map_err(|e| e.to_string())?;
+        let mut config = self.config.lock().map_err(|e| e.to_string())?.clone();
+        config.copy_received = enabled;
+        save(&self.path, &config)?;
+        *self.config.lock().map_err(|e| e.to_string())? = config;
+        self.state()
+    }
+
+    pub fn add_peer(&self, name: &str, code: &str) -> Result<LanState, String> {
+        let _guard = self
+            .operation
+            .try_lock()
+            .map_err(|_| "设备设置正在更改，请重试配对")?;
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 40 {
             return Err("设备名称需为 1–40 个字符".into());
@@ -238,6 +340,9 @@ impl LanService {
             peer.name = name.to_owned();
             peer.key = key;
         } else {
+            if config.peers.len() >= 32 {
+                return Err("最多保存 32 台设备".into());
+            }
             config.peers.push(Peer {
                 name: name.to_owned(),
                 address,
@@ -253,6 +358,9 @@ impl LanService {
         let _guard = self.operation.lock().map_err(|e| e.to_string())?;
         let mut config = self.config.lock().map_err(|e| e.to_string())?.clone();
         config.peers.retain(|p| p.address != address);
+        if config.auto_send.as_deref() == Some(address) {
+            config.auto_send = None;
+        }
         save(&self.path, &config)?;
         *self.config.lock().map_err(|e| e.to_string())? = config;
         self.state()
@@ -290,9 +398,16 @@ impl LanService {
     }
 
     pub fn send_text(&self, address: &str, text: &str) -> Result<(), String> {
-        if text.trim().is_empty() || text.len() > clipboard::MAX_TEXT_BYTES {
-            return Err("只能传送不超过 2 MB 的非空文本".into());
-        }
+        self.send(address, |key| encrypt_frame(key, text))
+    }
+    pub fn send_image(&self, address: &str, png: &[u8]) -> Result<(), String> {
+        self.send(address, |key| encrypt_payload(key, b"CKI1", png))
+    }
+    fn send(
+        &self,
+        address: &str,
+        frame: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, String>,
+    ) -> Result<(), String> {
         let peer = self
             .config
             .lock()
@@ -303,26 +418,91 @@ impl LanService {
             .cloned()
             .ok_or("设备未配对")?;
         let key = decode_key(&peer.key)?;
-        let target: SocketAddr = peer.address.parse().map_err(|_| "设备地址无效")?;
-        if !matches!(target, SocketAddr::V4(a) if allowed_ip(*a.ip()) && a.port() == PORT) {
-            return Err("仅支持本地网络 IPv4 地址和默认端口".into());
-        }
-        let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(3))
-            .map_err(|e| format!("连接设备失败：{e}"))?;
-        send_stream(&mut stream, &key, text)
+        let (target, _) = parse_code(&format!("{CODE_PREFIX}{}/{}", peer.address, peer.key))?;
+        let mut stream =
+            TcpStream::connect_timeout(&SocketAddr::V4(target), Duration::from_secs(3))
+                .map_err(|e| format!("连接设备失败：{e}"))?;
+        transfer(&mut stream, &key, &frame(&key)?)
     }
 }
 
+fn discovery_loop(socket: UdpSocket, stop: Arc<AtomicBool>) {
+    let name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "clipkeep Desktop".into());
+    let name: String = name.chars().take(40).collect();
+    let mut buffer = [0u8; 128];
+    let mut budget = 20u8;
+    let mut window = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let Ok((len, source)) = socket.recv_from(&mut buffer) else {
+            continue;
+        };
+        if window.elapsed() >= Duration::from_secs(1) {
+            budget = 20;
+            window = std::time::Instant::now();
+        }
+        if budget == 0
+            || !matches!(source.ip(), IpAddr::V4(ip) if allowed_ip(ip))
+            || len != 38
+            || &buffer[..6] != b"CKD1? "
+        {
+            continue;
+        }
+        if !buffer[6..38].iter().all(u8::is_ascii_hexdigit) {
+            continue;
+        }
+        budget -= 1;
+        let reply = serde_json::json!({"protocol":"CKD1", "nonce":std::str::from_utf8(&buffer[6..38]).unwrap(), "name":name, "port":PORT, "images":true, "pair":true});
+        let _ = socket.send_to(reply.to_string().as_bytes(), source);
+    }
+}
+
+#[cfg(test)]
 fn send_stream(stream: &mut TcpStream, key: &[u8; 32], text: &str) -> Result<(), String> {
+    transfer(stream, key, &encrypt_frame(key, text)?)
+}
+
+struct DeadlineIo<'a> {
+    stream: &'a mut TcpStream,
+    until: std::time::Instant,
+}
+impl<'a> DeadlineIo<'a> {
+    fn new(stream: &'a mut TcpStream) -> Self {
+        Self {
+            stream,
+            until: std::time::Instant::now() + Duration::from_secs(15),
+        }
+    }
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.until
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "传输超时"))
+    }
+}
+impl Read for DeadlineIo<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.stream
+            .set_read_timeout(Some(self.remaining()?.min(Duration::from_secs(5))))?;
+        self.stream.read(bytes)
+    }
+}
+impl Write for DeadlineIo<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream
+            .set_write_timeout(Some(self.remaining()?.min(Duration::from_secs(5))))?;
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn transfer(stream: &mut TcpStream, key: &[u8; 32], frame: &[u8]) -> Result<(), String> {
+    let mut stream = DeadlineIo::new(stream);
     stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(4)))
-        .map_err(|e| e.to_string())?;
-    let frame = encrypt_frame(key, text)?;
-    stream
-        .write_all(&frame)
+        .write_all(frame)
         .map_err(|e| format!("发送失败：{e}"))?;
     let mut ack = [0u8; 30];
     stream
@@ -357,14 +537,64 @@ fn receive_loop(listener: TcpListener, key: [u8; 32], app: AppHandle, stop: Arc<
 }
 
 fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Result<(), String> {
-    receive_stream(stream, key, |text| {
-        let core = app.state::<Core>();
-        core.save_text(text, Some("局域网"))?;
-        changed(app);
-        Ok(())
-    })
+    let core = app.state::<Core>();
+    let copy_received = core
+        .lan
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .copy_received;
+    let message = read_message(&mut DeadlineIo::new(stream), key)?;
+    match message {
+        Message::Text(text) => {
+            if text.contains(CODE_PREFIX) {
+                return Err("配对码不能进入历史".into());
+            }
+            core.save_text(&text, Some("局域网"))?;
+            if copy_received && let Err(e) = crate::clipboard::write_text(&text) {
+                eprintln!("Received text saved; clipboard write failed: {e}");
+            }
+        }
+        Message::Image(png) => {
+            let _work = crate::images::IMAGE_WORK
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let (w, h) = image::ImageReader::with_format(
+                std::io::Cursor::new(&png),
+                image::ImageFormat::Png,
+            )
+            .into_dimensions()
+            .map_err(|e| e.to_string())?;
+            if u64::from(w) * u64::from(h) > lan_wire::MAX_IMAGE_PIXELS {
+                return Err("图片超过 1600 万像素".into());
+            }
+            let img = crate::images::decode_png(&png)?;
+            let saved = core.images.write(&img, &crate::images::hash(&img))?;
+            core.save_image(&saved, Some("局域网"))?;
+            if copy_received && let Err(e) = crate::clipboard::write_image(&img) {
+                eprintln!("Received image saved; clipboard write failed: {e}");
+            }
+        }
+        Message::Pair(json) => {
+            #[derive(Deserialize)]
+            struct Pair {
+                name: String,
+                key: String,
+            }
+            let request: Pair = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let source = stream.peer_addr().map_err(|e| e.to_string())?.ip();
+            core.lan.add_peer(
+                &request.name,
+                &format!("{CODE_PREFIX}{source}:{PORT}/{}", request.key),
+            )?;
+            let _ = app.emit("lan-state-changed", ());
+        }
+    }
+    changed(app);
+    stream.write_all(&make_ack(key)?).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn receive_stream(
     stream: &mut TcpStream,
     key: &[u8; 32],
@@ -381,6 +611,57 @@ fn receive_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_returns_only_public_metadata() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let address = socket.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || discovery_loop(socket, worker_stop));
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .send_to(b"CKD1? 0123456789abcdef0123456789abcdef", address)
+            .unwrap();
+        let mut reply = [0u8; 1024];
+        let (len, _) = client.recv_from(&mut reply).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&reply[..len]).unwrap();
+        assert_eq!(json["nonce"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(json["protocol"], "CKD1");
+        assert_eq!(json["port"], PORT);
+        assert!(json.get("key").is_none());
+        assert!(json.get("code").is_none());
+    }
+    #[test]
+    fn sync_settings_persist_and_pairing_never_blocks_receiver_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = LanService::new(dir.path());
+        let code = format!(
+            "{CODE_PREFIX}100.64.0.2:{PORT}/{}",
+            service.config.lock().unwrap().receive_key
+        );
+        service.add_peer("phone", &code).unwrap();
+        service
+            .set_auto_send(Some(format!("100.64.0.2:{PORT}")))
+            .unwrap();
+        service.set_copy_received(true).unwrap();
+        let state = LanService::new(dir.path()).state().unwrap();
+        assert!(state.copy_received);
+        assert!(state.auto_send.is_some());
+        let guard = service.operation.lock().unwrap();
+        assert!(service.add_peer("phone", &code).is_err());
+        drop(guard);
+        service.remove_peer(&format!("100.64.0.2:{PORT}")).unwrap();
+        assert!(service.state().unwrap().auto_send.is_none());
+    }
 
     #[test]
     fn code_and_encryption_roundtrip() {

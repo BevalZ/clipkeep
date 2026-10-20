@@ -30,10 +30,11 @@ public final class MainActivity extends Activity {
     private boolean onlyFavorites, started, busy, hasNext;
     private int offset, loadGeneration;
     private Future<?> loadTask;
-    private LanReceiver receiver;
+    private String lastClipboard = "";
+    private final ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::captureAutomatic;
     private AlertDialog dialog;
     private final Runnable searchLater = () -> { offset = 0; reload(); };
-    private final Runnable receivedLater = () -> { if (!started) return; status.setText("已收到局域网文本"); offset = 0; reload(); };
+
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -50,7 +51,7 @@ public final class MainActivity extends Activity {
         LinearLayout header = row();
         TextView title = label("clipkeep", 27); title.setTypeface(null, Typeface.BOLD);
         header.addView(title, new LinearLayout.LayoutParams(0, dp(52), 1));
-        header.addView(button("局域网", this::lanDialog)); root.addView(header);
+        header.addView(button("设备", this::lanDialog)); root.addView(header);
         search = new EditText(this); search.setSingleLine(true); search.setTextSize(16);
         search.setHint("搜索剪贴板历史"); search.setContentDescription("搜索剪贴板历史");
         search.setFilters(new InputFilter[]{new InputFilter.LengthFilter(512)});
@@ -58,6 +59,7 @@ public final class MainActivity extends Activity {
         LinearLayout actions = row();
         actions.addView(button("粘贴保存", this::captureClipboard), weight());
         actions.addView(button("新建", () -> compose(null)), weight());
+        actions.addView(button("图片", this::chooseImage), weight());
         favorites = button(onlyFavorites ? "全部" : "收藏", () -> {
             onlyFavorites = !onlyFavorites; favorites.setText(onlyFavorites ? "全部" : "收藏"); offset = 0; reload();
         });
@@ -88,7 +90,7 @@ public final class MainActivity extends Activity {
         list.setAdapter(adapter);
         list.setOnItemClickListener((parent, view, position, id) -> copy(rows.get(position).id));
         list.setOnItemLongClickListener((parent, view, position, id) -> { clipActions(rows.get(position)); return true; });
-        TextView empty = label("还没有记录\n点击“粘贴保存”，或从其他应用分享文本到 clipkeep", 16);
+        TextView empty = label("还没有记录\n点击“粘贴保存”，或从其他应用分享文本、图片到 clipkeep", 16);
         empty.setGravity(Gravity.CENTER); empty.setPadding(0, dp(30), 0, dp(30));
         FrameLayout content = new FrameLayout(this);
         content.addView(list, new FrameLayout.LayoutParams(-1, -1));
@@ -116,12 +118,21 @@ public final class MainActivity extends Activity {
         if (state == null) handleIntent(getIntent());
     }
 
-    @Override protected void onStart() { super.onStart(); started = true; reload(); }
+    @Override protected void onStart() {
+        super.onStart(); started = true;
+        app.updates = error -> { if (error != null) toast(error); refreshStatus(); reload(); };
+        getSystemService(ClipboardManager.class).addPrimaryClipChangedListener(clipboardListener);
+        refreshStatus(); reload();
+    }
+    @Override public void onWindowFocusChanged(boolean focused) {
+        super.onWindowFocusChanged(focused); if (focused && started) captureAutomatic();
+    }
     @Override protected void onStop() {
         started = false; ++loadGeneration;
-        handler.removeCallbacks(searchLater); handler.removeCallbacks(receivedLater);
+        handler.removeCallbacks(searchLater);
+        app.updates = null;
+        getSystemService(ClipboardManager.class).removePrimaryClipChangedListener(clipboardListener);
         if (loadTask != null) { loadTask.cancel(false); app.worker.purge(); }
-        stopReceiver();
         if (dialog != null) { dialog.dismiss(); dialog = null; }
         rows.clear(); adapter.notifyDataSetChanged();
         super.onStop();
@@ -133,6 +144,12 @@ public final class MainActivity extends Activity {
     @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); handleIntent(intent); }
     private void handleIntent(Intent intent) {
         String action = intent.getAction();
+        if (Intent.ACTION_SEND.equals(action) && intent.getType() != null && intent.getType().startsWith("image/")) {
+            android.net.Uri uri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            intent.removeExtra(Intent.EXTRA_STREAM);
+            if (uri != null) handler.post(() -> importImage(uri));
+            return;
+        }
         if (Intent.ACTION_SEND.equals(action) || Intent.ACTION_PROCESS_TEXT.equals(action)) {
             CharSequence shared = intent.getCharSequenceExtra(Intent.ACTION_SEND.equals(action) ? Intent.EXTRA_TEXT : Intent.EXTRA_PROCESS_TEXT);
             intent.removeExtra(Intent.EXTRA_TEXT); intent.removeExtra(Intent.EXTRA_PROCESS_TEXT);
@@ -173,19 +190,54 @@ public final class MainActivity extends Activity {
                     T result = work.call();
                     handler.post(() -> { busy = false; if (started && !isDestroyed()) complete.accept(result); });
                 } catch (Exception error) {
-                    handler.post(() -> { busy = false; if (started && !isDestroyed()) toast(error.getMessage()); });
+                    handler.post(() -> { busy = false; if (started && !isDestroyed()) { refreshStatus(); toast(error.getMessage()); } });
                 }
             });
         } catch (RejectedExecutionException error) { busy = false; toast("正在处理，请稍后重试"); }
     }
-    private void captureClipboard() {
-        ClipboardManager clipboard = getSystemService(ClipboardManager.class);
-        ClipData data = clipboard.getPrimaryClip();
-        if (data == null || data.getItemCount() == 0 || data.getItemAt(0).getText() == null) { toast("剪贴板没有文本"); return; }
-        CharSequence value = data.getItemAt(0).getText();
-        if (value.length() > LanProtocol.MAX_TEXT_BYTES) { toast("文本超过 2 MB"); return; }
-        String text = value.toString();
-        task(() -> { app.store.save(text); return "已保存"; }, message -> { toast(message); offset = 0; reload(); });
+    private void chooseImage() {
+        startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("image/*").addCategory(Intent.CATEGORY_OPENABLE), 42);
+    }
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request == 42 && result == RESULT_OK && data != null && data.getData() != null) importImage(data.getData());
+    }
+    private void importImage(android.net.Uri uri) {
+        task(() -> app.store.saveImage(Images.fromUri(this, uri)), id -> { toast("图片已保存"); offset = 0; reload(); });
+    }
+    private void captureClipboard() { capture(false); }
+    private void captureAutomatic() {
+        if (started && hasWindowFocus() && !busy && preferences().getBoolean("foreground_sync", false)) capture(true);
+    }
+    private void capture(boolean automatic) {
+        ClipData data = getSystemService(ClipboardManager.class).getPrimaryClip();
+        if (data == null || data.getItemCount() == 0) { if (!automatic) toast("剪贴板为空"); return; }
+        if (automatic && String.valueOf(data.getDescription().getLabel()).startsWith("clipkeep")) return;
+        ClipData.Item item = data.getItemAt(0);
+        android.net.Uri uri = item.getUri(); CharSequence value = item.getText();
+        if (uri == null && value == null) { if (!automatic) toast("剪贴板没有文本或图片"); return; }
+        if (value != null && value.length() > LanProtocol.MAX_TEXT_BYTES) { if (!automatic) toast("文本超过 2 MB"); return; }
+        String text = value == null ? null : value.toString();
+        if (text != null && text.contains(LanProtocol.PREFIX)) return;
+        String fingerprint;
+        try {
+            String content = uri != null ? uri + ":" + data.getDescription().getTimestamp() : text;
+            fingerprint = Base64.getEncoder().encodeToString(java.security.MessageDigest.getInstance("SHA-256").digest(content.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.GeneralSecurityException error) { toast("无法计算剪贴板摘要"); return; }
+        if (automatic && fingerprint.equals(lastClipboard)) return;
+        String target = automatic ? preferences().getString("sync_peer", "") : "";
+        task(() -> {
+            long id = uri != null ? app.store.saveImage(Images.fromUri(this, uri)) : app.store.save(text);
+            if (!target.isEmpty()) {
+                JSONArray saved = peers(); boolean found = false;
+                for (int i=0; i<saved.length(); i++) {
+                    LanProtocol.Peer peer = LanProtocol.parseCode(saved.getJSONObject(i).getString("code"));
+                    if (peer.address.equals(target)) { Transfer.clip(app.store, id, peer); found = true; break; }
+                }
+                if (!found) throw new IOException("同步设备已移除，请重新选择");
+            }
+            return id;
+        }, id -> { lastClipboard = fingerprint; if (!automatic) toast("已保存"); offset = 0; reload(); if (automatic) handler.post(this::captureAutomatic); });
     }
     private void compose(String initial) {
         EditText input = new EditText(this); input.setHint("输入或粘贴文本"); input.setMinLines(4); input.setMaxLines(10);
@@ -201,15 +253,30 @@ public final class MainActivity extends Activity {
         });
     }
     private void copy(long id) {
-        task(() -> app.store.text(id), text -> {
-            try { getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("clipkeep", text)); toast("已复制"); }
-            catch (RuntimeException error) { toast("系统剪贴板无法接收这么长的文本，请使用局域网发送"); }
+        task(() -> app.store.isImage(id) ? ClipData.newUri(getContentResolver(), "clipkeep 图片", ImageProvider.uri(id))
+                : ClipData.newPlainText("clipkeep", app.store.text(id)), data -> {
+            try { getSystemService(ClipboardManager.class).setPrimaryClip(data); toast("已复制，可到其他应用粘贴"); }
+            catch (RuntimeException error) { toast("系统剪贴板无法接收，请使用设备发送"); }
         });
+    }
+    private void previewImage(long id) {
+        task(() -> Images.preview(app.store.imageFile(id)), bitmap -> {
+            if (bitmap == null) { toast("图片无法预览"); return; }
+            ImageView preview = new ImageView(this); preview.setImageBitmap(bitmap); preview.setAdjustViewBounds(true);
+            show(new AlertDialog.Builder(this).setTitle("图片预览").setView(preview).setPositiveButton("关闭", null).create());
+        });
+    }
+    private void shareImage(long id) {
+        android.net.Uri uri = ImageProvider.uri(id);
+        Intent intent = new Intent(Intent.ACTION_SEND).setType("image/png").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.setClipData(ClipData.newUri(getContentResolver(), "clipkeep 图片", uri));
+        startActivity(Intent.createChooser(intent, "分享图片"));
     }
     private void clipActions(ClipStore.Row clip) {
         String[] choices = {"复制", "预览", clip.favorite ? "取消收藏" : "收藏", clip.pinned ? "取消置顶" : "置顶", "发送到设备", "系统分享", "删除"};
-        show(new AlertDialog.Builder(this).setTitle("文本操作").setItems(choices, (d, index) -> {
+        show(new AlertDialog.Builder(this).setTitle(clip.image ? "图片操作" : "文本操作").setItems(choices, (d, index) -> {
             if (index == 0) copy(clip.id);
+            else if (index == 1 && clip.image) previewImage(clip.id);
             else if (index == 1) task(() -> app.store.text(clip.id), text -> {
                 TextView preview = label(text.substring(0, Math.min(text.length(), 16000)) + (text.length() > 16000 ? "\n\n… 预览仅显示前 16000 字，复制与局域网发送使用全文。" : ""), 16);
                 preview.setTextIsSelectable(true); preview.setPadding(dp(20), dp(12), dp(20), dp(12));
@@ -218,6 +285,7 @@ public final class MainActivity extends Activity {
             });
             else if (index == 2 || index == 3) task(() -> { app.store.toggle(clip.id, index == 2); return true; }, done -> reload());
             else if (index == 4) sendDialog(clip.id);
+            else if (index == 5 && clip.image) shareImage(clip.id);
             else if (index == 5) task(() -> app.store.text(clip.id), text -> {
                 // Binder transactions are bounded; large texts use the LAN protocol instead.
                 if (text.length() > 64000) { toast("长文本请使用局域网发送"); return; }
@@ -228,46 +296,66 @@ public final class MainActivity extends Activity {
         }).create());
     }
 
-    private android.content.SharedPreferences preferences() { return getSharedPreferences("lan", MODE_PRIVATE); }
-    private JSONArray peers() {
-        try { return new JSONArray(preferences().getString("peers", "[]")); }
-        catch (JSONException error) { return new JSONArray(); }
+    private android.content.SharedPreferences preferences() { return LanSettings.prefs(this); }
+    private JSONArray peers() { return LanSettings.peers(this); }
+    private byte[] receiveKey() { return LanSettings.key(this); }
+    private void refreshStatus() {
+        if (status != null) status.setText(ReceiveService.running ? "后台接收已开启 · 文本 / 图片 · Wi-Fi / Tailnet" : "点击条目复制 · 长按预览、分享或发送");
     }
-    private byte[] receiveKey() {
-        String saved = preferences().getString("key", null);
-        if (saved != null) try {
-            byte[] key = Base64.getUrlDecoder().decode(saved); if (key.length == 32) return key;
-        } catch (IllegalArgumentException ignored) { }
-        byte[] key = LanProtocol.newKey();
-        preferences().edit().putString("key", Base64.getUrlEncoder().withoutPadding().encodeToString(key)).apply();
-        return key;
+    private void stopReceiver() { stopService(new Intent(this, ReceiveService.class)); refreshStatus(); }
+    private void startReceiver() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 43);
+        startForegroundService(new Intent(this, ReceiveService.class));
+        handler.postDelayed(this::refreshStatus, 300);
     }
-    private void stopReceiver() {
-        if (receiver != null) { receiver.close(); receiver = null; }
-        if (status != null) status.setText("点击条目复制 · 长按查看更多操作");
-    }
-    private void toggleReceive() {
-        if (receiver != null) { stopReceiver(); return; }
-        try {
-            receiver = new LanReceiver(receiveKey(), app.store, new LanReceiver.Listener() {
-                public void received() { handler.removeCallbacks(receivedLater); handler.post(receivedLater); }
-                public void failed(Exception error) { /* Untrusted failed frames never touch UI or clipboard. */ }
-            });
-            status.setText("局域网接收已开启 · 离开应用后自动关闭");
-        } catch (IOException error) { toast("接收启动失败：" + error.getMessage()); }
-    }
+    private void toggleReceive() { if (ReceiveService.running) stopReceiver(); else startReceiver(); }
     private void lanDialog() {
-        String[] actions = {receiver == null ? "开启前台接收" : "关闭接收", "复制本机配对码", "添加设备", "管理已配对设备", "重置本机配对码"};
-        show(new AlertDialog.Builder(this).setTitle("局域网加密互传").setItems(actions, (d, index) -> {
+        String[] actions = {ReceiveService.running ? "关闭后台接收" : "开启后台接收", "扫描响应设备", "复制本机配对码", "手动添加设备", "管理已配对设备", "复制与同步设置", "重置本机配对码"};
+        show(new AlertDialog.Builder(this).setTitle("Wi-Fi / Tailnet 设备").setItems(actions, (d, index) -> {
             if (index == 0) toggleReceive();
-            if (index == 1) localCodes();
-            if (index == 2) addPeer();
-            if (index == 3) managePeers();
-            if (index == 4) show(new AlertDialog.Builder(this).setTitle("重置配对码？").setMessage("旧配对码将失效，其他设备需要重新添加此手机。")
-                .setNegativeButton("取消", null).setPositiveButton("重置", (a, b) -> {
-                    stopReceiver(); preferences().edit().remove("key").apply(); receiveKey(); toast("已重置，接收已关闭");
+            if (index == 1) scanDialog();
+            if (index == 2) localCodes();
+            if (index == 3) addPeer();
+            if (index == 4) managePeers();
+            if (index == 5) syncSettings();
+            if (index == 6) show(new AlertDialog.Builder(this).setTitle("重置配对码？").setMessage("旧码将失效，后台接收会停止，其他设备需要重新配对。")
+                .setNegativeButton("取消", null).setPositiveButton("重置", (a,b) -> {
+                    stopReceiver(); preferences().edit().remove("key").apply(); receiveKey(); toast("已重置");
                 }).create());
         }).setNegativeButton("关闭", null).create());
+    }
+    private void syncSettings() {
+        String[] labels = {"收到后复制到系统剪贴板", "前台记录剪贴板，可发送到所选设备"};
+        boolean[] checked = {preferences().getBoolean("copy_received", false), preferences().getBoolean("foreground_sync", false)};
+        show(new AlertDialog.Builder(this).setTitle("复制与同步")
+            .setMultiChoiceItems(labels, checked, (d, index, value) -> preferences().edit().putBoolean(index == 0 ? "copy_received" : "foreground_sync", value).apply())
+            .setNeutralButton("选择发送设备", (d,w) -> {
+                JSONArray saved = peers();
+                if (saved.length() == 0) { toast("请先配对设备"); return; }
+                show(new AlertDialog.Builder(this).setTitle("前台自动发送到").setItems(peerNames(saved), (a,i) -> {
+                    try { preferences().edit().putString("sync_peer", LanProtocol.parseCode(saved.getJSONObject(i).getString("code")).address).apply(); toast("已设置"); }
+                    catch (Exception error) { toast(error.getMessage()); }
+                }).setNegativeButton("取消", null).create());
+            }).setPositiveButton("完成", (d,w) -> toast("安卓只能在前台读取剪贴板；后台可接收，通知保持静音。接收内容不会再次自动发送。")).create());
+    }
+    private void scanDialog() {
+        EditText targets = new EditText(this); targets.setHint("可选：Tailscale IPv4，多台用空格分隔");
+        targets.setText(preferences().getString("scan_hosts", "")); targets.setMaxLines(4);
+        targets.setFilters(new InputFilter[]{new InputFilter.LengthFilter(512)});
+        show(new AlertDialog.Builder(this).setTitle("扫描响应设备")
+            .setMessage("同 Wi-Fi 自动广播发现；Tailnet 请输入设备的 100.x IPv4 地址。对方需升级 clipkeep 并开启接收，防火墙允许 UDP/TCP 45788。")
+            .setView(targets).setNegativeButton("取消", null).setPositiveButton("扫描", (d,w) -> {
+                String hosts = targets.getText().toString(); preferences().edit().putString("scan_hosts", hosts).apply();
+                status.setText("正在扫描，约 3 秒…");
+                task(() -> Discovery.scan(hosts), devices -> {
+                    refreshStatus();
+                    if (devices.isEmpty()) { toast("未发现响应设备，请检查接收开关、网络和防火墙"); return; }
+                    String[] names = new String[devices.size()]; for (int i=0;i<names.length;i++) names[i] = devices.get(i).toString();
+                    show(new AlertDialog.Builder(this).setTitle("选择要配对的设备").setItems(names, (a,i) -> addPeer(devices.get(i)))
+                        .setNegativeButton("取消", null).create());
+                });
+            }).create());
     }
     private void localCodes() {
         task(() -> {
@@ -283,35 +371,41 @@ public final class MainActivity extends Activity {
             }
             return addresses;
         }, addresses -> {
-            if (addresses.isEmpty()) { toast("请先连接局域网 Wi-Fi"); return; }
+            if (addresses.isEmpty()) { toast("请先连接 Wi-Fi 或 Tailscale"); return; }
             show(new AlertDialog.Builder(this).setTitle("选择与电脑相通的本机地址")
                 .setItems(addresses.toArray(new String[0]), (d, i) -> {
                     String code = LanProtocol.PREFIX + addresses.get(i) + ":" + LanProtocol.PORT + "/" + Base64.getUrlEncoder().withoutPadding().encodeToString(receiveKey());
                     getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("clipkeep 配对码", code));
-                    toast("配对码已复制；开启接收后请保持应用在前台");
+                    toast("配对码已复制；请开启后台接收");
                 }).create());
         });
     }
-    private void addPeer() {
+    private void addPeer() { addPeer(null); }
+    private void addPeer(Discovery.Device device) {
         LinearLayout fields = column(); fields.setPadding(dp(20), 0, dp(20), 0);
         EditText name = new EditText(this); name.setHint("设备名称"); name.setSingleLine(true); name.setFilters(new InputFilter[]{new InputFilter.LengthFilter(40)});
         EditText code = new EditText(this); code.setHint("粘贴 cklan1:// 配对码"); code.setSingleLine(true); code.setFilters(new InputFilter[]{new InputFilter.LengthFilter(128)});
+        if (device != null) name.setText(device.name);
         fields.addView(name); fields.addView(code);
-        AlertDialog add = new AlertDialog.Builder(this).setTitle("添加发送设备").setView(fields)
+        CheckBox mutual = new CheckBox(this); mutual.setText("建立双向配对（对方需新版）"); mutual.setChecked(true); fields.addView(mutual);
+        AlertDialog add = new AlertDialog.Builder(this).setTitle(device == null ? "添加设备" : device.address).setMessage("填写对方的完整配对码。扫描不传输密钥；双向配对会通过加密连接将本机添加到对方设备列表。").setView(fields)
             .setNegativeButton("取消", null).setPositiveButton("添加", null).create();
         show(add);
         add.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
                 String label = name.getText().toString().trim(); if (label.isEmpty()) throw new IOException("请输入设备名称");
                 LanProtocol.Peer peer = LanProtocol.parseCode(code.getText().toString());
-                JSONArray saved = peers(), updated = new JSONArray();
-                for (int i = 0; i < saved.length(); i++) {
-                    JSONObject old = saved.getJSONObject(i);
-                    if (!LanProtocol.parseCode(old.getString("code")).address.equals(peer.address)) updated.put(old);
-                }
-                if (updated.length() >= 32) throw new IOException("最多保存 32 台设备，请先移除不用的设备");
-                updated.put(new JSONObject().put("name", label).put("code", peer.code()));
-                preferences().edit().putString("peers", updated.toString()).apply(); add.dismiss(); toast("已添加设备");
+                if (device != null && !peer.socketAddress().getAddress().getHostAddress().equals(device.address)) throw new IOException("配对码地址与所选设备不一致");
+                boolean both = mutual.isChecked();
+                if (both) startReceiver();
+                task(() -> {
+                    if (both) {
+                        String body = new JSONObject().put("name", Build.MODEL.substring(0, Math.min(40, Build.MODEL.length())))
+                            .put("key", Base64.getUrlEncoder().withoutPadding().encodeToString(receiveKey())).toString();
+                        Transfer.send(peer, out -> LanProtocol.writePayload(out, peer.key, 0x434b5031, body.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                    }
+                    LanSettings.add(this, label, peer); return true;
+                }, done -> { add.dismiss(); toast(both ? "双向配对完成，可互发文本和图片" : "已添加发送设备"); });
             } catch (Exception error) { toast(error.getMessage()); }
         });
     }
@@ -324,7 +418,7 @@ public final class MainActivity extends Activity {
         JSONArray saved = peers();
         if (saved.length() == 0) { toast("还没有配对设备"); return; }
         show(new AlertDialog.Builder(this).setTitle("选择要移除的设备").setItems(peerNames(saved), (d, index) -> {
-            saved.remove(index); preferences().edit().putString("peers", saved.toString()).apply(); toast("设备已移除");
+            task(() -> { LanSettings.remove(this, LanProtocol.parseCode(saved.getJSONObject(index).getString("code")).address); return true; }, done -> toast("设备已移除"));
         }).create());
     }
     private void sendDialog(long id) {
@@ -332,17 +426,7 @@ public final class MainActivity extends Activity {
         if (saved.length() == 0) { addPeer(); return; }
         show(new AlertDialog.Builder(this).setTitle("发送到设备").setItems(peerNames(saved), (d, index) -> task(() -> {
             LanProtocol.Peer peer = LanProtocol.parseCode(saved.getJSONObject(index).getString("code"));
-            String text = app.store.text(id);
-            try (Socket socket = new Socket()) {
-                // Absolute deadline also interrupts a peer that stops reading during write().
-                ScheduledExecutorService deadline = Executors.newSingleThreadScheduledExecutor();
-                deadline.schedule(() -> { try { socket.close(); } catch (IOException ignored) { } }, 8, TimeUnit.SECONDS);
-                try {
-                    socket.connect(peer.socketAddress(), 3000); socket.setSoTimeout(4000);
-                    LanProtocol.writeText(socket.getOutputStream(), peer.key, text);
-                    LanProtocol.verifyAck(socket.getInputStream(), peer.key);
-                } finally { deadline.shutdownNow(); }
-            }
+            Transfer.clip(app.store, id, peer);
             return "已发送，对方已确认保存";
         }, this::toast)).create());
     }

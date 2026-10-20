@@ -12,7 +12,7 @@
 
 > Windows 桌面端采用 Rust + Tauri 2；Android 采用原生 Java。支持本地历史、搜索和局域网加密文本互传。MIT 开源。
 
-新增 [原生 Android 文本客户端](android/README.md)，支持收藏、搜索和与桌面端加密互传。本次 [内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理。
+新增 [原生 Android 客户端](android/README.md)，支持文本/图片、收藏、搜索、后台接收及与桌面端加密互传。本次 [内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理。
 
 ![浅色和深色主界面](assets/screenshots/hero.png)
 
@@ -45,7 +45,7 @@ Windows 自带的 Win+V 我用了很久，问题大家应该都遇到过：
 
 **一句话总结：** 轻量、免安装、界面现代，同时自带局域网加密互传。目前这几样能同时满足的，只有 clipkeep。
 
-> 桌面版支持文字和图片；资源管理器图片文件捕获、管理员窗口粘贴为 Windows 功能。Android 首版提供文本历史和加密互传，不支持图片、分组或桌面备份。富文本和任意文件尚不支持。
+> 桌面版支持文字和图片；资源管理器图片文件捕获、管理员窗口粘贴为 Windows 功能。Android 支持文本和图片历史、扫描配对、Wi-Fi / Tailnet 加密互传和后台接收，暂不支持分组或桌面备份。富文本和任意文件尚不支持。
 
 ---
 
@@ -72,9 +72,9 @@ Windows 自带的 Win+V 我用了很久，问题大家应该都遇到过：
 - Ctrl+P / S / D 置顶、收藏、删除，Tab 切换分组
 
 **📡 局域网互传**
-- 两台电脑配对后，任意一条文字一键发过去
+- Windows / Android 配对后，文本和图片一键发送，支持同 Wi-Fi 或 Tailscale IPv4
 - ChaCha20-Poly1305 加密，点对点直连，**不经过任何服务器**
-- 对方收到的内容只进历史，不会覆盖他正在用的剪贴板
+- 默认收到后存入历史，也可开启“收到后复制”；自动发送默认关闭
 
 ![发送端、接收端和配对设置](assets/screenshots/lan.png)
 
@@ -125,7 +125,7 @@ Windows 数据位于 `%APPDATA%\com.clipkeep.clipboard\`。迁移或卸载前可
 2. **发送方**：同一页面 → 添加设备 → 粘贴配对码
 3. 在任意文本条目右侧点 **发送** 图标，选择设备
 
-配对是单向的，想互发就两边各加一次。端口是 `45788/TCP`，防火墙弹窗时点允许即可。
+Android 0.3.0 的“扫描响应设备”可发现同 Wi-Fi 客户端，输入对方配对码后可建立双向配对。手动配对码仍可单向添加；端口是 `45788/TCP+UDP`。Tailnet 的发现方式和 Android 后台剪贴板限制见 [Android 使用说明](android/README.md)。
 
 ### 从源码构建
 
@@ -140,7 +140,7 @@ node ../ui/node_modules/@tauri-apps/cli/tauri.js build
 
 从 `native` 运行 CLI，输出在 `native/target/release/bundle`。Windows 可加 `--no-bundle` 仅生成便携 exe。Android 构建见 [android/README.md](android/README.md)。
 
-维护者可手动运行 GitHub Actions 的 **Release** 工作流。流水线验证各端版本一致、测试并构建 Windows 和 Android，校验安卓签名，再创建版本 tag、上传安装包及 SHA-256 文件并公开 release。签名密钥通过仓库 Secrets 提供。
+维护者可手动运行 GitHub Actions 的 **Release** 工作流，默认只生成构建产物；勾选 publish 才公开发布。流水线验证各端版本一致、测试并构建 Windows 和 Android，校验安卓签名，再创建版本 tag、上传安装包及 SHA-256 文件并公开 release。签名密钥通过仓库 Secrets 提供。
 
 ---
 

@@ -731,6 +731,7 @@ onMounted(async () => {
     await listen("window-shown", onShown),
     await listen("window-hidden", onHidden),
     await listen("settings-changed", syncSettings),
+    await listen<string>("lan-sync-error", (e) => { if (windowShown) flash(`自动发送失败：${e.payload}`); }),
     await listen<boolean>("capture-paused-changed", (e) => (paused.value = e.payload)),
   );
   if (await getCurrentWindow().isVisible()) await onShown();
@@ -885,7 +886,7 @@ onUnmounted(() => {
       <button class="menu-row" @click="menuAction('copy')"><ClipIcon name="copy" /><span class="menu-text">仅复制</span><span class="menu-shortcut">Shift+Enter</span></button>
       <button v-if="menuClip.kind === 'text'" class="menu-row" @click="menuAction('preview')"><ClipIcon name="eye" /><span class="menu-text">查看 / 编辑</span></button>
       <div class="menu-divider"></div>
-      <button v-if="menuClip.kind === 'text'" class="menu-row" @click="openSendMenu(menuClip, $event)"><ClipIcon name="send" /><span class="menu-text">发送到设备</span><ClipIcon name="chevron" class="menu-chevron" /></button>
+      <button class="menu-row" @click="openSendMenu(menuClip, $event)"><ClipIcon name="send" /><span class="menu-text">发送到设备</span><ClipIcon name="chevron" class="menu-chevron" /></button>
       <button class="menu-row" @click="openMoveMenu(menuClip, $event)"><ClipIcon name="folder" /><span class="menu-text">移动到分组</span><ClipIcon name="chevron" class="menu-chevron" /></button>
       <div class="menu-divider"></div>
       <button class="menu-row" @click="menuAction('favorite')"><ClipIcon :name="menuClip.favorite ? 'star-fill' : 'star'" /><span class="menu-text">{{ menuClip.favorite ? '取消收藏' : '收藏' }}</span></button>
@@ -905,7 +906,7 @@ onUnmounted(() => {
       <button class="menu-row" @click="moveTo(null)"><ClipIcon name="close" /><span class="menu-text">移出分组</span></button>
     </div>
     <div v-if="sendMenu.open" class="menu menu-surface send-menu" :style="{ left: sendMenu.x + 'px', top: sendMenu.y + 'px' }" role="group" aria-label="发送到设备" tabindex="-1" @click.stop>
-      <div class="menu-label">发送文本到</div>
+      <div class="menu-label">发送到</div>
       <div v-if="sendLoading" class="send-menu-message" role="status">正在读取设备…</div>
       <template v-else>
         <button v-for="peer in lanPeers" :key="peer.address" class="menu-row" :disabled="sendBusy" :title="`${peer.name} · ${peer.address}`" :aria-label="`发送到 ${peer.name}（${peer.address}）`" @click="sendTo(peer)"><ClipIcon name="send" /><span class="menu-text">{{ peer.name }}</span></button>

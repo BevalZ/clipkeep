@@ -32,6 +32,64 @@ public class StorageTest {
         store.save("literal % _ \\"); assertEquals(1, store.list("% _ \\", false, 0).size());
         try { store.save("cklan1://secret"); fail("pairing code stored"); } catch (IOException expected) { }
     }
+    private byte[] png() {
+        android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888);
+        bitmap.eraseColor(android.graphics.Color.RED);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(); bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out); bitmap.recycle();
+        return out.toByteArray();
+    }
+    @Test public void testImagesProviderAndProtection() throws Exception {
+        byte[] png = png(); long id = store.saveImage(png);
+        assertEquals(id, store.saveImage(png)); assertTrue(store.isImage(id));
+        assertEquals(1, store.list("", false, 0).size()); assertTrue(store.list("", false, 0).get(0).image);
+        assertArrayEquals(png, store.imageBytes(id));
+        assertThrows(IOException.class, () -> store.text(id));
+        store.toggle(id, true); store.clearHistory(); assertTrue(store.imageFile(id).exists());
+        File file = store.imageFile(id); store.delete(id); assertFalse(file.exists());
+        assertThrows(Exception.class, () -> store.saveImage(new byte[]{1,2,3}));
+    }
+    @Test public void testMigrationKeepsTextAndFlags() throws Exception {
+        store.close(); getContext().deleteDatabase("history.db");
+        android.database.sqlite.SQLiteDatabase db = getContext().openOrCreateDatabase("history.db", 0, null);
+        db.execSQL("CREATE TABLE clips (_id INTEGER PRIMARY KEY, content TEXT NOT NULL, preview TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, bytes INTEGER NOT NULL, favorite INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL)");
+        db.execSQL("INSERT INTO clips VALUES(1,'旧文本','旧文本','legacy',9,1,1,1)"); db.setVersion(1); db.close();
+        store = new ClipStore(getContext()); assertEquals("旧文本", store.text(1));
+        assertFalse(store.isImage(1)); assertTrue(store.list("", true, 0).get(0).pinned);
+        assertTrue(store.isImage(store.saveImage(png())));
+    }
+    @Test public void testDiscoveryNonceAndNoKeyLeak() throws Exception {
+        java.net.DatagramSocket server = new java.net.DatagramSocket(0, java.net.InetAddress.getByName("127.0.0.1"));
+        Thread responder = new Thread(() -> Discovery.respond(server, "test-device")); responder.start();
+        try (java.net.DatagramSocket client = new java.net.DatagramSocket()) {
+            client.setSoTimeout(1500);
+            byte[] query = "CKD1? 0123456789abcdef0123456789abcdef".getBytes();
+            client.send(new java.net.DatagramPacket(query, query.length, java.net.InetAddress.getByName("127.0.0.1"), server.getLocalPort()));
+            byte[] bytes = new byte[1024]; java.net.DatagramPacket reply = new java.net.DatagramPacket(bytes, bytes.length); client.receive(reply);
+            org.json.JSONObject json = new org.json.JSONObject(new String(bytes,0,reply.getLength()));
+            assertEquals("0123456789abcdef0123456789abcdef", json.getString("nonce"));
+            assertFalse(json.has("key")); assertFalse(json.has("code"));
+        } finally { server.close(); responder.join(2000); }
+    }
+    @Test public void testReceiverImageAckAndRejectInvalidImage() throws Exception {
+        byte[] key = LanProtocol.newKey();
+        try (LanReceiver receiver = new LanReceiver(getContext(), key, store, new LanReceiver.Listener() {
+            public void received(long id) { }
+            public void failed(Exception error) { }
+        })) {
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", LanProtocol.PORT)) {
+                socket.setSoTimeout(3000);
+                LanProtocol.writePayload(socket.getOutputStream(), key, 0x434b4931, png());
+                LanProtocol.verifyAck(socket.getInputStream(), key);
+            }
+            assertEquals(1, store.list("", false, 0).size());
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", LanProtocol.PORT)) {
+                socket.setSoTimeout(3000);
+                LanProtocol.writePayload(socket.getOutputStream(), key, 0x434b4931, new byte[]{1,2,3});
+                assertThrows(IOException.class, () -> LanProtocol.verifyAck(socket.getInputStream(), key));
+            }
+            assertEquals(1, store.list("", false, 0).size());
+        }
+    }
     @Test public void testDeviceCryptoProvider() throws Exception {
         ByteArrayOutputStream frame = new ByteArrayOutputStream(); byte[] key = LanProtocol.newKey();
         LanProtocol.writeText(frame, key, "Android 设备加密测试");

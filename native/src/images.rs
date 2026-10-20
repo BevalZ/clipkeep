@@ -318,6 +318,9 @@ impl ImageStore {
     }
 
     pub fn png_bytes(&self, file: &str) -> std::io::Result<Vec<u8>> {
+        self.png_bytes_limited(file, usize::MAX - 1)
+    }
+    pub fn png_bytes_limited(&self, file: &str, limit: usize) -> std::io::Result<Vec<u8>> {
         let hash = file_hash(file)
             .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "图片文件名无效"))?;
         let path = self.existing_path(&self.originals, hash);
@@ -330,7 +333,17 @@ impl ImageStore {
                 return Err(IoError::new(ErrorKind::InvalidData, "图片路径包含重解析点"));
             }
         }
-        std::fs::read(path)
+        use std::io::Read;
+        let input = std::fs::File::open(path)?;
+        if input.metadata()?.len() > limit as u64 {
+            return Err(IoError::new(ErrorKind::InvalidData, "图片超过传送大小限制"));
+        }
+        let mut bytes = Vec::new();
+        input.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(IoError::new(ErrorKind::InvalidData, "图片超过传送大小限制"));
+        }
+        Ok(bytes)
     }
 
     pub fn thumb_path(&self, file: &str) -> Option<PathBuf> {
