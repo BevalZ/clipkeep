@@ -67,7 +67,8 @@
           "$APPDATA/thumbs/**/*"
         ]
       }
-    }
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
