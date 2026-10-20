@@ -26,15 +26,11 @@ def version():
 def collect(target, platform):
     build = ROOT / "native/target" / target / "release"
     ASSETS.mkdir(exist_ok=True)
-    extensions = {"windows-x64": ["exe"], "linux-x64": ["deb", "AppImage"],
-                  "macos-arm64": ["dmg"], "macos-x64": ["dmg"]}[platform]
-    for extension in extensions:
-        matches = list((build / "bundle").rglob(f"*.{extension}"))
-        assert len(matches) == 1, f"Expected one {extension}, found {matches}"
-        suffix = "-setup" if extension == "exe" else ""
-        shutil.copy2(matches[0], ASSETS / f"clipkeep-{version()}-{platform}{suffix}.{extension}")
-    if platform == "windows-x64":
-        shutil.copy2(build / "clipkeep.exe", ASSETS / f"clipkeep-{version()}-{platform}-portable.exe")
+    assert platform == "windows-x64", "Only Windows desktop releases are enabled"
+    matches = list((build / "bundle" / "nsis").glob("*.exe"))
+    assert len(matches) == 1, f"Expected one NSIS installer, found {matches}"
+    shutil.copy2(matches[0], ASSETS / f"clipkeep-{version()}-windows-x64-setup.exe")
+    shutil.copy2(build / "clipkeep.exe", ASSETS / f"clipkeep-{version()}-windows-x64-portable.exe")
 
 
 def gh(*args):
@@ -44,8 +40,9 @@ def gh(*args):
 def publish():
     value = version()
     tag = f"v{value}"
-    expected = ["windows-x64-setup.exe", "windows-x64-portable.exe", "linux-x64.deb",
-                "linux-x64.AppImage", "macos-arm64.dmg", "macos-x64.dmg", "android.apk", "android.aab"]
+    expected = ["windows-x64-setup.exe", "windows-x64-portable.exe", "android.apk", "android.aab"]
+    allowed = {f"clipkeep-{value}-{name}" for name in expected} | {"android-signature.txt", "SHA256SUMS"}
+    assert all(p.name in allowed for p in ASSETS.iterdir()), "Unexpected release artifact"
     for name in expected:
         path = ASSETS / f"clipkeep-{value}-{name}"
         assert path.is_file() and path.stat().st_size > 0, f"Missing {path}"

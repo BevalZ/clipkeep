@@ -8,9 +8,9 @@
             src="https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+" /></a>
 </p>
 
-# clipkeep：跨平台剪贴板历史与轻量 Android 客户端
+# clipkeep：Windows 剪贴板历史与轻量 Android 客户端
 
-> Windows、Linux、macOS 桌面端采用 Rust + Tauri 2；Android 采用原生 Java。支持本地历史、搜索和局域网加密文本互传。MIT 开源。
+> Windows 桌面端采用 Rust + Tauri 2；Android 采用原生 Java。支持本地历史、搜索和局域网加密文本互传。MIT 开源。
 
 新增 [原生 Android 文本客户端](android/README.md)，支持收藏、搜索和与桌面端加密互传。本次 [内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理。
 
@@ -113,13 +113,11 @@ CI 每次提交都会跑 `cargo fmt`、`cargo test` 和 `clippy -D warnings`。
 | 平台 | 安装包与使用条件 |
 | --- | --- |
 | Windows x64 | `windows-x64-setup.exe` 安装包，或 `windows-x64-portable.exe` 便携程序；依赖 WebView2 |
-| Linux x64 | `.deb` 或 `.AppImage`；桌面监听、快捷键和自动粘贴需要 **X11 会话**，原生 Wayland 尚不支持 |
-| macOS 12+ | Apple Silicon 用 `macos-arm64.dmg`，Intel 用 `macos-x64.dmg`；自动粘贴需在系统设置授予“辅助功能”权限 |
 | Android 9+ | `android.apk` 为正式签名通用安装包；`.aab` 是应用商店用 bundle，不能直接安装 |
 
-macOS 包使用 ad-hoc 签名，尚未取得 Apple Developer ID 签名或公证，系统可能阻止首次打开。Windows 包未做 Authenticode 签名。安卓正式签名和校验方法见 [发布说明](RELEASE_NOTES.md)。
+本次仅发布 Windows 和 Android 安装包。Windows 包未做 Authenticode 签名。安卓正式签名和校验方法见 [发布说明](RELEASE_NOTES.md)。
 
-桌面数据位于各系统的应用数据目录（Windows：`%APPDATA%\com.clipkeep.clipboard\`）。迁移或卸载前可导出备份；卸载前先关闭自启。Linux/macOS 的系统剪贴板图片在读取时由系统库解码，40 MP 限制不能约束系统库解码阶段的峰值内存；Windows 的敏感剪贴板排除标记也不适用于其他平台。
+Windows 数据位于 `%APPDATA%\com.clipkeep.clipboard\`。迁移或卸载前可导出备份；卸载前先关闭自启。
 
 ### 局域网互传怎么配
 
@@ -142,7 +140,7 @@ node ../ui/node_modules/@tauri-apps/cli/tauri.js build
 
 从 `native` 运行 CLI，输出在 `native/target/release/bundle`。Windows 可加 `--no-bundle` 仅生成便携 exe。Android 构建见 [android/README.md](android/README.md)。
 
-维护者可手动运行 GitHub Actions 的 **Release** 工作流。流水线验证各端版本一致、测试并构建全部平台，校验安卓签名，再创建版本 tag、上传安装包及 SHA-256 文件并公开 release。签名密钥通过仓库 Secrets 提供。
+维护者可手动运行 GitHub Actions 的 **Release** 工作流。流水线验证各端版本一致、测试并构建 Windows 和 Android，校验安卓签名，再创建版本 tag、上传安装包及 SHA-256 文件并公开 release。签名密钥通过仓库 Secrets 提供。
 
 ---
 

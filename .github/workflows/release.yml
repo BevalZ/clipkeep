@@ -22,23 +22,7 @@ jobs:
 
   desktop:
     needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows-x64
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux-x64
-          - os: macos-15
-            target: aarch64-apple-darwin
-            platform: macos-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            platform: macos-x64
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v7
@@ -48,17 +32,12 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
-          key: ${{ matrix.target }}
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libxdo-dev
+          key: x86_64-pc-windows-msvc
       - run: npm --prefix ui ci
       - name: Build frontend for Rust checks
         run: npm --prefix ui run build
@@ -66,20 +45,16 @@ jobs:
         working-directory: native
         run: |
           cargo fmt --all -- --check
-          cargo test --locked --target ${{ matrix.target }}
-          cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+          cargo test --locked --target x86_64-pc-windows-msvc
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnings
       - name: Package desktop
         working-directory: native
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: '1'
-          # Ad-hoc signing supports Apple Silicon without claiming Developer ID notarization.
-          APPLE_SIGNING_IDENTITY: '-'
-        run: node ../ui/node_modules/@tauri-apps/cli/tauri.js build --target ${{ matrix.target }} -- --locked
+        run: node ../ui/node_modules/@tauri-apps/cli/tauri.js build --target x86_64-pc-windows-msvc -- --locked
       - name: Collect desktop installers
-        run: python3 scripts/release.py collect --target ${{ matrix.target }} --platform ${{ matrix.platform }}
+        run: python3 scripts/release.py collect --target x86_64-pc-windows-msvc --platform windows-x64
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}
+          name: release-windows-x64
           path: release-assets/*
           if-no-files-found: error
 
