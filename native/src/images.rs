@@ -6,8 +6,12 @@ use image::{
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::{Error as IoError, ErrorKind};
+#[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+/// Serialize application-owned image buffers across import, file capture and paste.
+pub static IMAGE_WORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const THUMB_MAX_W: u32 = 640;
 const THUMB_MAX_H: u32 = 240;
@@ -17,6 +21,7 @@ const MAX_SIDE: u32 = 30_000;
 /// Hard ceiling on decoder allocations, so a malformed or hostile PNG fails instead of aborting
 /// the process on an out-of-memory allocation.
 const MAX_DECODE_ALLOC: u64 = 400 * 1024 * 1024;
+#[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 pub struct Rgba {
@@ -76,7 +81,16 @@ fn temp_image_file(name: &str) -> bool {
 
 fn is_reparse_point(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        Ok(metadata) => {
+            #[cfg(windows)]
+            {
+                metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            }
+            #[cfg(not(windows))]
+            {
+                metadata.file_type().is_symlink()
+            }
+        }
         Err(error) => error.kind() != ErrorKind::NotFound,
     }
 }
@@ -115,6 +129,9 @@ fn into_rgba(decoded: image::DynamicImage) -> Result<Rgba, String> {
 }
 
 pub fn decode_png(png: &[u8]) -> Result<Rgba, String> {
+    let header = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
+    let (width, height) = header.into_dimensions().map_err(|e| e.to_string())?;
+    check_size(width, height)?;
     let mut reader = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
     reader.limits(limits());
     into_rgba(reader.decode().map_err(|e| e.to_string())?)
@@ -266,10 +283,38 @@ impl ImageStore {
         reject_reparse(&self.originals)?;
         reject_reparse(path.parent().ok_or("图片路径无效")?)?;
         reject_reparse(&path)?;
-        let mut reader = ImageReader::open(path).map_err(|e| e.to_string())?;
-        reader.set_format(ImageFormat::Png);
-        reader.limits(limits());
-        into_rgba(reader.decode().map_err(|e| e.to_string())?)
+        decode_file(&path)
+    }
+
+    /// Promote an already validated staged image without decoding or buffering it again.
+    pub fn copy_from(&self, staged: &Self, file: &str) -> Result<(), String> {
+        let hash = file_hash(file).ok_or("图片文件名无效")?;
+        for (source, destination, base) in [
+            (
+                staged.original_path(hash),
+                self.original_path(hash),
+                &self.originals,
+            ),
+            (
+                staged.thumb_path_for_hash(hash),
+                self.thumb_path_for_hash(hash),
+                &self.thumbs,
+            ),
+        ] {
+            reject_reparse(base)?;
+            let parent = destination.parent().ok_or("图片路径无效")?;
+            reject_reparse(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            reject_reparse(&destination)?;
+            if !destination.is_file() {
+                crate::atomic_file::save_stream(&destination, |target| {
+                    std::io::copy(&mut std::fs::File::open(&source)?, target)?;
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     pub fn png_bytes(&self, file: &str) -> std::io::Result<Vec<u8>> {
@@ -433,6 +478,12 @@ mod tests {
         let digest = hash(&image);
         let saved = store.write(&image, &digest).unwrap();
         assert_eq!(store.load(&saved.file).unwrap().pixels, image.pixels);
+        let staged_dir = tempfile::tempdir().unwrap();
+        let promoted = ImageStore::new(staged_dir.path()).unwrap();
+        promoted.copy_from(&store, &saved.file).unwrap();
+        promoted.copy_from(&store, &saved.file).unwrap();
+        assert_eq!(promoted.load(&saved.file).unwrap().pixels, image.pixels);
+        assert!(promoted.copy_from(&store, "../private.png").is_err());
         assert_eq!(
             decode_png(&std::fs::read(store.thumb_path(&saved.file).unwrap()).unwrap())
                 .unwrap()

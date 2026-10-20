@@ -1,6 +1,6 @@
 use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -65,6 +65,7 @@ pub struct NewClip<'a> {
 }
 
 /// A full row for export/import; content is the text or the image file name.
+#[derive(Serialize, Deserialize)]
 pub struct RawClip {
     pub kind: String,
     pub content: String,
@@ -105,7 +106,8 @@ fn preview_of(kind: &str, content: &str) -> Option<String> {
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA cache_size = -2048; PRAGMA mmap_size = 0; PRAGMA temp_store = FILE;")?;
+    conn.set_prepared_statement_cache_capacity(8);
     // Fails fast on a damaged file so the caller can move it aside instead of crashing later.
     let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     if check != "ok" {
@@ -162,28 +164,28 @@ fn migrate_v1(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
          );",
     )?;
     if had_v0 {
-        let old: Vec<(String, i64, Option<i64>, i64, i64, i64)> = {
+        {
             let mut stmt = tx.prepare(
                 "SELECT content, favorite, fav_at, created_at, updated_at, use_count FROM clips_v0",
             )?;
-            stmt.query_map([], |r| {
+            let old = stmt.query_map([], |r| {
                 Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<_>>()?
-        };
-        for (content, favorite, fav_at, created_at, updated_at, use_count) in old {
-            tx.execute(
+            })?;
+            for row in old {
+                let (content, favorite, fav_at, created_at, updated_at, use_count) = row?;
+                tx.execute(
                 "INSERT OR IGNORE INTO clips (kind, content, hash, favorite, fav_at, created_at, updated_at, use_count)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![KIND_TEXT, content, text_hash(&content), favorite, fav_at, created_at, updated_at, use_count],
             )?;
+            }
         }
         tx.execute_batch("DROP TABLE clips_v0;")?;
     }
@@ -353,14 +355,15 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
         let kind: String = r.get(1)?;
         let body: String = r.get(2)?;
         let is_image = kind == KIND_IMAGE;
+        let (preview, file) = if is_image {
+            (String::new(), Some(body))
+        } else {
+            (body, None)
+        };
         Ok(Clip {
             id: r.get(0)?,
-            preview: if is_image {
-                String::new()
-            } else {
-                body.clone()
-            },
-            file: is_image.then_some(body),
+            preview,
+            file,
             kind,
             size: r.get(3)?,
             truncated: !is_image && r.get::<_, Option<bool>>(4)?.unwrap_or(false),
@@ -566,10 +569,16 @@ pub fn reorder_groups(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
     tx.commit()
 }
 
-/// All clip ids, oldest first; export fetches each row separately so the lock is never held long.
-pub fn clip_ids(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM clips ORDER BY created_at, id")?;
-    stmt.query_map([], |r| r.get(0))?.collect()
+/// Export freezes the upper ID bound, then visits at most 128 IDs per batch.
+pub fn last_clip_id(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM clips", [], |r| r.get(0))
+}
+
+pub fn clip_id_batch(conn: &Connection, after: i64, last: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM clips WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT 128")?;
+    stmt.query_map(params![after, last], |r| r.get(0))?
+        .collect()
 }
 
 pub fn export_one(conn: &Connection, id: i64) -> rusqlite::Result<Option<RawClip>> {
@@ -627,6 +636,32 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn export_batches_exclude_later_inserts_and_survive_deletions() {
+        let conn = mem();
+        for i in 0..300 {
+            add(&conn, &format!("item {i}"), 10);
+        }
+        let last = last_clip_id(&conn).unwrap();
+        let first = clip_id_batch(&conn, 0, last).unwrap();
+        assert_eq!(first.len(), 128);
+        add(&conn, "arrived after snapshot", 10);
+        delete(&conn, 150).unwrap();
+        let mut after = *first.last().unwrap();
+        let mut count = first.len();
+        loop {
+            let batch = clip_id_batch(&conn, after, last).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= 128);
+            assert!(batch.iter().all(|id| *id > after && *id <= last));
+            count += batch.len();
+            after = *batch.last().unwrap();
+        }
+        assert_eq!(count, 299);
     }
 
     #[test]

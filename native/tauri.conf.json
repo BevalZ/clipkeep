@@ -1,12 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "clipkeep",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.clipkeep.clipboard",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../ui"
+    },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../ui"
+    },
     "frontendDist": "../ui/dist"
   },
   "app": {
@@ -30,6 +36,7 @@
       },
       {
         "label": "tray_menu",
+        "create": false,
         "title": "clipkeep 菜单",
         "url": "index.html?tray=1",
         "width": 200,
@@ -64,7 +71,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

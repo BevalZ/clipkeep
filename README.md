@@ -8,9 +8,11 @@
             src="https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+" /></a>
 </p>
 
-# clipkeep：一个 exe 搞定 Windows 剪贴板历史
+# clipkeep：跨平台剪贴板历史与轻量 Android 客户端
 
-> Rust + Tauri 2 写的，单文件 8 MB，免安装。历史不限条数，能搜能分组，还能在局域网里加密互传。MIT 开源。
+> Windows、Linux、macOS 桌面端采用 Rust + Tauri 2；Android 采用原生 Java。支持本地历史、搜索和局域网加密文本互传。MIT 开源。
+
+新增 [原生 Android 文本客户端](android/README.md)，支持收藏、搜索和与桌面端加密互传。本次 [内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理。
 
 ![浅色和深色主界面](assets/screenshots/hero.png)
 
@@ -35,7 +37,7 @@ Windows 自带的 Win+V 我用了很久，问题大家应该都遇到过：
 |  | **clipkeep** | Ditto | CopyQ | EcoPaste | PasteBar |
 |---|---|---|---|---|---|
 | **技术栈** | **Rust + Tauri 2 + Vue 3** | C++ / MFC | C++ / Qt | Rust + Tauri 2 + React | Rust + Tauri + React |
-| **分发方式** | **单个 exe，8 MB** | 安装包 / 便携目录 | 安装包 / 便携目录 | 安装包 | 安装包 |
+| **分发方式** | **Windows 便携 exe / 各平台安装包** | 安装包 / 便携目录 | 安装包 / 便携目录 | 安装包 | 安装包 |
 | **局域网互传** | **✅ 内置，加密直连，免账号** | 需手动配置 IP | ❌ | ❌ | ❌ |
 | **界面** | **现代，跟随系统深浅色** | 老式 Win32 | Qt 传统风格 | 现代 | 现代 |
 | **往管理员窗口粘贴** | **✅ 开箱即用** | 需自行提权运行 | 需自行提权运行 | 需自行提权运行 | 需自行提权运行 |
@@ -43,7 +45,7 @@ Windows 自带的 Win+V 我用了很久，问题大家应该都遇到过：
 
 **一句话总结：** 轻量、免安装、界面现代，同时自带局域网加密互传。目前这几样能同时满足的，只有 clipkeep。
 
-> 实话实说：如果你需要 **跨平台**，或者要记录 **富文本和任意文件**，CopyQ 和 EcoPaste 目前做得更全。clipkeep 只做 Windows，专注把文字和图片这两样做好。
+> 桌面版支持文字和图片；资源管理器图片文件捕获、管理员窗口粘贴为 Windows 功能。Android 首版提供文本历史和加密互传，不支持图片、分组或桌面备份。富文本和任意文件尚不支持。
 
 ---
 
@@ -65,7 +67,7 @@ Windows 自带的 Win+V 我用了很久，问题大家应该都遇到过：
 ![收藏、分组和托盘菜单](assets/screenshots/organize.png)
 
 **⌨️ 键盘党友好**
-- Win+V 呼出（可改），↑↓ 选择，Enter 直接粘贴回原窗口
+- Windows 用 Win+V 呼出，macOS / Linux 用 Ctrl+Shift+V（可改），↑↓ 选择，Enter 直接粘贴回原窗口
 - Ctrl+1 ~ 9 一键粘贴第 N 条
 - Ctrl+P / S / D 置顶、收藏、删除，Tab 切换分组
 
@@ -93,12 +95,12 @@ Windows 自带的 Win+V 我用了很久，问题大家应该都遇到过：
 | 前端 | Vue 3.5 · TypeScript 6 · Vite 8 |
 | 数据存储 | SQLite（rusqlite 内置编译，WAL 模式） |
 | 剪贴板 | clipboard-master 监听 + arboard 读写 |
-| 全局快捷键 | windows-sys 低级键盘钩子 + SendInput 模拟粘贴 |
+| 全局快捷键 | Windows 原生键盘钩子；macOS / Linux 全局快捷键插件 + Enigo 粘贴 |
 | 图片处理 | image crate，支持 PNG / JPEG / GIF / WebP / BMP / TIFF |
 | 内容去重 | blake3 |
 | 传输加密 | ChaCha20-Poly1305 |
 
-Release 构建开了 thin LTO、`opt-level=3`、`panic=abort` 和 strip，最终产物只有一个 exe，运行时只依赖 Windows 自带的 WebView2。
+Release 构建启用 thin LTO、`opt-level=3`、`panic=abort` 和 strip。Windows 使用 WebView2，Linux 使用 WebKitGTK 4.1，macOS 使用系统 WKWebView。
 
 CI 每次提交都会跑 `cargo fmt`、`cargo test` 和 `clippy -D warnings`。
 
@@ -106,11 +108,18 @@ CI 每次提交都会跑 `cargo fmt`、`cargo test` 和 `clippy -D warnings`。
 
 ## 上手
 
-1. 从 [GitHub Releases](https://github.com/Fomovet/clipkeep/releases) 下载 `clipkeep.exe`
-2. 放到任意目录，双击运行（会弹一次 UAC）
-3. 按 **Win+V**，开始用
+从 [GitHub Releases](https://github.com/BevalZ/clipkeep/releases/latest) 选择对应平台：
 
-数据保存在 `%APPDATA%\com.clipkeep.clipboard\`。卸载时删掉 exe 和这个目录即可；如果开了自启，先在设置里关掉。
+| 平台 | 安装包与使用条件 |
+| --- | --- |
+| Windows x64 | `windows-x64-setup.exe` 安装包，或 `windows-x64-portable.exe` 便携程序；依赖 WebView2 |
+| Linux x64 | `.deb` 或 `.AppImage`；桌面监听、快捷键和自动粘贴需要 **X11 会话**，原生 Wayland 尚不支持 |
+| macOS 12+ | Apple Silicon 用 `macos-arm64.dmg`，Intel 用 `macos-x64.dmg`；自动粘贴需在系统设置授予“辅助功能”权限 |
+| Android 9+ | `android.apk` 为正式签名通用安装包；`.aab` 是应用商店用 bundle，不能直接安装 |
+
+macOS 包使用 ad-hoc 签名，尚未取得 Apple Developer ID 签名或公证，系统可能阻止首次打开。Windows 包未做 Authenticode 签名。安卓正式签名和校验方法见 [发布说明](RELEASE_NOTES.md)。
+
+桌面数据位于各系统的应用数据目录（Windows：`%APPDATA%\com.clipkeep.clipboard\`）。迁移或卸载前可导出备份；卸载前先关闭自启。Linux/macOS 的系统剪贴板图片在读取时由系统库解码，40 MP 限制不能约束系统库解码阶段的峰值内存；Windows 的敏感剪贴板排除标记也不适用于其他平台。
 
 ### 局域网互传怎么配
 
@@ -122,23 +131,29 @@ CI 每次提交都会跑 `cargo fmt`、`cargo test` 和 `clippy -D warnings`。
 
 ### 从源码构建
 
-```powershell
+先安装 Rust stable、Node.js 24 和目标平台的 Tauri 2 系统依赖。Linux 需 GTK 3、WebKitGTK 4.1、AppIndicator 和 X11 开发库。
+
+```sh
 npm --prefix ui ci
-.\ui\node_modules\.bin\tauri.cmd dev                 # 开发模式
-.\ui\node_modules\.bin\tauri.cmd build --no-bundle   # 单 exe：native/target/release/clipkeep.exe
-.\ui\node_modules\.bin\tauri.cmd build               # 额外生成 NSIS 安装包
+cd native
+node ../ui/node_modules/@tauri-apps/cli/tauri.js dev
+node ../ui/node_modules/@tauri-apps/cli/tauri.js build
 ```
+
+从 `native` 运行 CLI，输出在 `native/target/release/bundle`。Windows 可加 `--no-bundle` 仅生成便携 exe。Android 构建见 [android/README.md](android/README.md)。
+
+维护者可手动运行 GitHub Actions 的 **Release** 工作流。流水线验证各端版本一致、测试并构建全部平台，校验安卓签名，再创建版本 tag、上传安装包及 SHA-256 文件并公开 release。签名密钥通过仓库 Secrets 提供。
 
 ---
 
 ## 说在前面
 
 - 日常使用没问题，欢迎大家帮忙找 bug
-- 默认以管理员身份运行，这样才能往管理员权限的窗口里粘贴
+- Windows 默认以管理员身份运行，以支持往管理员权限的窗口里粘贴
 - 数据只存在本机。本地数据库和备份文件暂时没有加密，敏感内容请留意
 - 少数环境下 Win+V 会被系统抢走，可以在设置里改成 Ctrl+Shift+V
 
-有问题或想要的功能，欢迎[提 Issue](https://github.com/Fomovet/clipkeep/issues)。觉得好用的话，点个 ⭐ 就是最大的支持 🙏
+有问题或想要的功能，欢迎[提 Issue](https://github.com/BevalZ/clipkeep/issues)。觉得好用的话，点个 ⭐ 就是最大的支持 🙏
 
 ## 许可证
 

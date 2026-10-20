@@ -2,22 +2,29 @@ use crate::images::{MAX_PIXELS, Rgba};
 use arboard::ImageData;
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use std::borrow::Cow;
+#[cfg(windows)]
 use std::ffi::OsString;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
-pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_TEXT_BYTES: usize = crate::lan_wire::MAX_TEXT_BYTES;
 
 /// Pairing codes grant send permission and should not become searchable history on either PC.
 fn should_record_text(text: &str) -> bool {
@@ -28,10 +35,15 @@ fn should_record_text(text: &str) -> bool {
 /// but we allow extra headroom without risking false positives from later real copies.
 const SUPPRESS_TTL: Duration = Duration::from_secs(2);
 
+#[cfg(windows)]
 const CF_DIB: u32 = 8;
+#[cfg(windows)]
 const CF_UNICODETEXT: u32 = 13;
+#[cfg(windows)]
 const CF_HDROP: u32 = 15;
+#[cfg(windows)]
 const CF_DIBV5: u32 = 17;
+#[cfg(windows)]
 const MAX_IMAGE_FILE_DROP: u32 = 128;
 
 static CAPTURE_IMAGES: AtomicBool = AtomicBool::new(true);
@@ -103,6 +115,7 @@ fn writeback_guard() -> &'static WritebackGuard {
 pub enum Captured {
     Text(String),
     Image(Rgba),
+    #[cfg(windows)]
     ImageFiles(Vec<PathBuf>),
 }
 
@@ -112,6 +125,7 @@ impl Captured {
         match self {
             Captured::Text(text) => crate::db::text_hash(text),
             Captured::Image(img) => crate::images::hash(img),
+            #[cfg(windows)]
             Captured::ImageFiles(paths) => {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(b"image-files\0");
@@ -187,11 +201,13 @@ impl<F: FnMut(Captured)> ClipboardHandler for &mut Handler<F> {
     }
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
 /// Password managers mark secrets with these formats so history tools skip them.
+#[cfg(windows)]
 fn is_excluded() -> bool {
     [
         "ExcludeClipboardContentFromMonitorProcessing",
@@ -204,8 +220,10 @@ fn is_excluded() -> bool {
     })
 }
 
+#[cfg(windows)]
 struct OpenedClipboard;
 
+#[cfg(windows)]
 impl OpenedClipboard {
     fn open() -> Option<Self> {
         for _ in 0..5 {
@@ -247,12 +265,14 @@ impl OpenedClipboard {
     }
 }
 
+#[cfg(windows)]
 impl Drop for OpenedClipboard {
     fn drop(&mut self) {
         unsafe { CloseClipboard() };
     }
 }
 
+#[cfg(windows)]
 fn png_dims(bytes: &[u8]) -> Option<(u64, u64)> {
     if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
         return None;
@@ -262,6 +282,7 @@ fn png_dims(bytes: &[u8]) -> Option<(u64, u64)> {
     Some((w as u64, h as u64))
 }
 
+#[cfg(windows)]
 fn dib_dims(bytes: &[u8]) -> Option<(u64, u64)> {
     if bytes.len() < 12 {
         return None;
@@ -271,6 +292,7 @@ fn dib_dims(bytes: &[u8]) -> Option<(u64, u64)> {
     Some((w.unsigned_abs() as u64, h.unsigned_abs() as u64))
 }
 
+#[cfg(windows)]
 fn supported_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -281,6 +303,7 @@ fn supported_image_file(path: &Path) -> bool {
         })
 }
 
+#[cfg(windows)]
 enum ImageFileDrop {
     Busy,
     Ignored,
@@ -289,6 +312,7 @@ enum ImageFileDrop {
 
 /// Explorer puts file paths in CF_HDROP instead of publishing the image pixels.
 /// Read only the paths while the clipboard is open; file decoding happens later.
+#[cfg(windows)]
 fn read_image_file_drop() -> ImageFileDrop {
     let Some(_opened) = OpenedClipboard::open() else {
         return ImageFileDrop::Busy;
@@ -325,6 +349,7 @@ fn read_image_file_drop() -> ImageFileDrop {
 
 /// arboard reads the whole payload (and decodes PNGs with no size limit) before we could check it,
 /// so a huge copy would exhaust memory and abort the app. Peek at sizes and headers first.
+#[cfg(windows)]
 fn too_large() -> bool {
     let Some(cb) = OpenedClipboard::open() else {
         return false;
@@ -375,6 +400,7 @@ fn read_with_retry(retry_delays: &[Duration]) -> Option<Captured> {
     let max_attempts = retry_delays.len() + 1;
 
     for attempt in 0..max_attempts {
+        #[cfg(windows)]
         if unsafe { IsClipboardFormatAvailable(CF_HDROP) != 0 } {
             if !CAPTURE_IMAGES.load(Ordering::Relaxed) {
                 return None;
@@ -430,11 +456,14 @@ fn read_with_retry(retry_delays: &[Duration]) -> Option<Captured> {
         }
 
         return match cb.get_image() {
-            Ok(img) => Some(Captured::Image(Rgba {
-                width: img.width as u32,
-                height: img.height as u32,
-                pixels: img.bytes.into_owned(),
-            })),
+            Ok(img) if img.width as u64 * img.height as u64 <= MAX_PIXELS => {
+                Some(Captured::Image(Rgba {
+                    width: img.width as u32,
+                    height: img.height as u32,
+                    pixels: img.bytes.into_owned(),
+                }))
+            }
+            Ok(_) => None,
             Err(e) => {
                 if attempt < retry_delays.len() {
                     thread::sleep(retry_delays[attempt]);
@@ -457,12 +486,14 @@ fn suppress_writeback(content_hash: String) {
     writeback_guard().suppress(content_hash);
 }
 
+#[cfg(windows)]
 pub fn write_text(text: &str) -> Result<(), arboard::Error> {
     let hash = crate::db::text_hash(text);
     suppress_writeback(hash);
     arboard::Clipboard::new()?.set_text(text.to_owned())
 }
 
+#[cfg(windows)]
 pub fn write_image(img: &Rgba) -> Result<(), arboard::Error> {
     let hash = crate::images::hash(img);
     suppress_writeback(hash);
@@ -471,6 +502,51 @@ pub fn write_image(img: &Rgba) -> Result<(), arboard::Error> {
         height: img.height as usize,
         bytes: Cow::Borrowed(&img.pixels),
     })
+}
+
+// X11 selections stay available only while the owner connection is alive.
+#[cfg(not(windows))]
+static WRITER: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+
+#[cfg(not(windows))]
+fn with_writer(
+    write: impl FnOnce(&mut arboard::Clipboard) -> Result<(), arboard::Error>,
+) -> Result<(), arboard::Error> {
+    let mut writer = WRITER.lock().map_err(|_| arboard::Error::Unknown {
+        description: "clipboard writer poisoned".into(),
+    })?;
+    if writer.is_none() {
+        *writer = Some(arboard::Clipboard::new()?);
+    }
+    write(writer.as_mut().unwrap())
+}
+
+#[cfg(not(windows))]
+pub fn write_text(text: &str) -> Result<(), arboard::Error> {
+    suppress_writeback(crate::db::text_hash(text));
+    with_writer(|writer| writer.set_text(text.to_owned()))
+}
+
+#[cfg(not(windows))]
+pub fn write_image(img: &Rgba) -> Result<(), arboard::Error> {
+    suppress_writeback(crate::images::hash(img));
+    with_writer(|writer| {
+        writer.set_image(ImageData {
+            width: img.width as usize,
+            height: img.height as usize,
+            bytes: Cow::Borrowed(&img.pixels),
+        })
+    })
+}
+
+#[cfg(not(windows))]
+fn is_excluded() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn too_large() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -487,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn reads_png_and_dib_headers() {
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
         png.extend_from_slice(&20000u32.to_be_bytes());

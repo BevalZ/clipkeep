@@ -258,7 +258,7 @@ onUnmounted(() => {
         <div class="row">
           <div class="label">
             <div class="name">外观</div>
-            <div class="desc">跟随系统时随 Windows 浅色 / 深色自动切换。</div>
+            <div class="desc">跟随系统时随系统浅色 / 深色自动切换。</div>
           </div>
           <div class="segmented" role="group" aria-label="外观">
             <button v-for="option in themeOptions" :key="option.id" type="button" :class="{ active: s.theme === option.id }" :aria-pressed="s.theme === option.id" @click="save({ theme: option.id })">{{ option.label }}</button>
@@ -267,7 +267,7 @@ onUnmounted(() => {
         <label class="row">
           <div class="label">
             <div class="name">开机自启</div>
-            <div class="desc">创建当前用户登录时以管理员权限运行的计划任务，启动后静默到托盘；关闭时删除任务。</div>
+            <div class="desc">登录后自动启动到托盘。Windows 使用管理员计划任务；macOS 和 Linux 使用用户登录启动项。</div>
           </div>
           <input type="checkbox" class="switch" :checked="autostart" @change="toggleAutostart" />
         </label>
@@ -354,7 +354,7 @@ onUnmounted(() => {
         <div v-if="lan.receiveEnabled" class="row lan-code-row">
           <div class="label">
             <div class="name">本机配对码</div>
-            <div class="desc">在另一台设备的 clipkeep 中添加；请通过可信方式传递。端口 45788，首次接收可能需要允许 Windows 防火墙访问。</div>
+            <div class="desc">在另一台设备的 clipkeep 中添加；请通过可信方式传递。端口 45788，首次接收可能需要允许系统防火墙访问。</div>
           </div>
           <div v-if="lan.localCodes.length" class="lan-addresses">
             <button v-for="item in lan.localCodes" :key="item.address" class="btn" @click="copyCode(item.address)">复制 {{ item.address }}</button>
@@ -385,7 +385,7 @@ onUnmounted(() => {
         <label class="row">
           <div class="label">
             <div class="name">全局快捷键{{ s.hotkeyEnabled ? `（${hotkeyLabel}）` : "" }}</div>
-            <div class="desc">Win+V 是 Windows 保留快捷键，可能与系统面板冲突；遇到冲突可选 Ctrl+Shift+V。clipkeep 不修改系统剪贴板设置；关闭快捷键后可从托盘打开。</div>
+            <div class="desc">Windows 默认 Win+V，可能与系统面板冲突；macOS / Linux 默认 Ctrl+Shift+V。遇到冲突可更换快捷键，关闭后可从托盘打开。</div>
           </div>
           <input type="checkbox" class="switch" :checked="s.hotkeyEnabled" @change="save({ hotkeyEnabled: !s.hotkeyEnabled })" />
         </label>

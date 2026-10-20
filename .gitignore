@@ -43,3 +43,19 @@ hotkey-diagnostics.enabled
 
 # Internal reviews and forum drafts stay local
 docs/
+
+# Build products and local toolchains
+native/**/target/
+android/.gradle/
+android/**/build/
+android/local.properties
+*.apk
+*.aab
+*.jks
+
+# Local UI validation artifacts
+.playwright-cli/
+output/
+
+# Local verification packages; published assets live in GitHub Releases
+artifacts/

@@ -1,23 +1,32 @@
 mod atomic_file;
+mod backup;
 mod clipboard;
 mod db;
 mod images;
 mod lan;
+mod lan_wire;
 mod settings;
+#[cfg(windows)]
+mod win;
+#[cfg(not(windows))]
+#[path = "platform_unix.rs"]
 mod win;
 
+use backup::{BundleClip, BundleGroup};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clipboard::Captured;
 use db::{Group, NewClip, RawClip, Scope};
-use images::{ImageStore, Rgba};
+use images::ImageStore;
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use settings::{Settings, SettingsFile};
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
@@ -25,9 +34,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const AUTOSTART_ARG: &str = "--minimized";
+#[cfg(windows)]
 const AUTOSTART_TASK: &str = "\\clipkeep-clipboard";
 const BUNDLE_VERSION: u32 = 1;
 const MAX_IMPORT_FILE: u64 = 2 * 1024 * 1024 * 1024;
@@ -172,6 +183,7 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
                 .write(&img, &hash)
                 .and_then(|saved| core.save_image(&saved, None))
         }
+        #[cfg(windows)]
         Captured::ImageFiles(paths) => {
             // A file selection can contain several large JPEGs. Keep decoding and PNG
             // thumbnail generation off the clipboard listener so later copies aren't missed.
@@ -183,6 +195,13 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
                     if clipboard::capture_paused() {
                         break;
                     }
+                    let _work = match images::IMAGE_WORK.lock() {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            eprintln!("image worker lock failed: {error}");
+                            break;
+                        }
+                    };
                     let result = images::decode_file(&path).and_then(|img| {
                         let hash = images::hash(&img);
                         let source = path.file_name().map(|name| name.to_string_lossy());
@@ -427,6 +446,7 @@ fn put_on_clipboard(core: &Core, id: i64) -> CmdResult<()> {
         .map_err(to_err)?
         .ok_or("条目不存在")?;
     if kind == db::KIND_IMAGE {
+        let _work = images::IMAGE_WORK.lock().map_err(to_err)?;
         let img = core.images.load(&content)?;
         clipboard::write_image(&img).map_err(to_err)?;
     } else {
@@ -500,6 +520,7 @@ fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<bool> {
     apply_autostart(&app, enabled)
 }
 
+#[cfg(windows)]
 fn run_schtasks(args: &[&str]) -> CmdResult<Output> {
     Command::new("schtasks.exe")
         .args(args)
@@ -508,10 +529,12 @@ fn run_schtasks(args: &[&str]) -> CmdResult<Output> {
         .map_err(to_err)
 }
 
+#[cfg(windows)]
 fn autostart_task_exists() -> bool {
     run_schtasks(&["/Query", "/TN", AUTOSTART_TASK]).is_ok_and(|output| output.status.success())
 }
 
+#[cfg(windows)]
 fn create_autostart_task() -> CmdResult<()> {
     if cfg!(debug_assertions) {
         return Err("请使用发布版设置开机自启".into());
@@ -540,6 +563,7 @@ fn create_autostart_task() -> CmdResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn delete_autostart_task() -> CmdResult<()> {
     if autostart_task_exists() {
         let output = run_schtasks(&["/Delete", "/TN", AUTOSTART_TASK, "/F"])?;
@@ -553,6 +577,7 @@ fn delete_autostart_task() -> CmdResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn apply_autostart(app: &AppHandle, enabled: bool) -> CmdResult<bool> {
     let launcher = app.autolaunch();
     if enabled {
@@ -565,6 +590,23 @@ fn apply_autostart(app: &AppHandle, enabled: bool) -> CmdResult<bool> {
         launcher.disable().map_err(to_err)?;
     }
     let now = autostart_task_exists();
+    let _ = app.emit("autostart-changed", now);
+    Ok(now)
+}
+
+#[cfg(not(windows))]
+fn autostart_task_exists() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn apply_autostart(app: &AppHandle, enabled: bool) -> CmdResult<bool> {
+    if enabled {
+        app.autolaunch().enable().map_err(to_err)?;
+    } else {
+        app.autolaunch().disable().map_err(to_err)?;
+    }
+    let now = app.autolaunch().is_enabled().map_err(to_err)?;
     let _ = app.emit("autostart-changed", now);
     Ok(now)
 }
@@ -636,10 +678,15 @@ fn update_settings(app: AppHandle, core: State<Core>, settings: Settings) -> Cmd
     if win::hotkey_label(&new.hotkey).is_none() {
         return Err("未知的快捷键".into());
     }
-    core.settings_file.save(&new).map_err(to_err)?;
+    if !win::set_hotkey(new.hotkey_enabled, &new.hotkey) {
+        return Err("无法注册快捷键，可能已被其他应用占用".into());
+    }
+    if let Err(error) = core.settings_file.save(&new) {
+        win::set_hotkey(old.hotkey_enabled, &old.hotkey);
+        return Err(to_err(error));
+    }
     *current = new.clone();
     drop(current);
-    win::set_hotkey(new.hotkey_enabled, &new.hotkey);
     clipboard::set_capture_images(new.capture_images);
 
     if new.max_storage_mb != old.max_storage_mb {
@@ -649,27 +696,6 @@ fn update_settings(app: AppHandle, core: State<Core>, settings: Settings) -> Cmd
     }
     let _ = app.emit("settings-changed", ());
     Ok(new)
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BundleGroup {
-    id: i64,
-    name: String,
-    sort_order: i64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BundleClip {
-    kind: String,
-    text: Option<String>,
-    image_b64: Option<String>,
-    favorite: bool,
-    pinned: bool,
-    group_id: Option<i64>,
-    created_at: i64,
-    updated_at: i64,
 }
 
 #[tauri::command]
@@ -686,13 +712,12 @@ async fn export_data(app: AppHandle) -> CmdResult<Option<String>> {
     };
     let path = path.into_path().map_err(to_err)?;
 
-    // Snapshot ids and groups under a brief lock, then fetch and encode each row lock-free and
-    // stream it to disk, so neither the DB nor memory is tied up for the whole export.
-    let (ids, groups) = {
+    // Snapshot the upper ID bound and groups, then export in bounded batches.
+    let (last_id, groups) = {
         let core = app.state::<Core>();
         let conn = core.conn()?;
         (
-            db::clip_ids(&conn).map_err(to_err)?,
+            db::last_clip_id(&conn).map_err(to_err)?,
             db::list_groups(&conn).map_err(to_err)?,
         )
     };
@@ -714,51 +739,52 @@ async fn export_data(app: AppHandle) -> CmdResult<Option<String>> {
         serde_json::to_writer(&mut w, &groups).map_err(io::Error::other)?;
         write!(w, ",\"clips\":[")?;
 
-        for id in ids {
-            let (raw, png) = {
+        let mut after = 0;
+        loop {
+            let ids = {
                 let core = app.state::<Core>();
-                let conn = core.conn().map_err(io::Error::other)?;
-                let Some(raw) = db::export_one(&conn, id).map_err(io::Error::other)? else {
-                    continue;
-                };
-                let png = if raw.kind == db::KIND_IMAGE {
-                    Some(core.images.png_bytes(&raw.content).map_err(|error| {
-                        io::Error::other(format!("图片条目 {id} 无法导出：{error}"))
-                    })?)
-                } else {
-                    None
-                };
-                (raw, png)
+                db::clip_id_batch(&*core.conn().map_err(io::Error::other)?, after, last_id).map_err(io::Error::other)?
             };
-            let clip = BundleClip {
-                image_b64: png.map(|bytes| STANDARD.encode(bytes)),
-                text: (raw.kind == db::KIND_TEXT).then_some(raw.content),
-                kind: raw.kind,
-                favorite: raw.favorite,
-                pinned: raw.pinned,
-                group_id: raw.group_id,
-                created_at: raw.created_at,
-                updated_at: raw.updated_at,
-            };
-            if count > 0 {
-                write!(w, ",")?;
+            if ids.is_empty() { break; }
+            for id in ids {
+                after = id;
+                let (raw, png) = {
+                    let core = app.state::<Core>();
+                    let conn = core.conn().map_err(io::Error::other)?;
+                    let Some(raw) = db::export_one(&conn, id).map_err(io::Error::other)? else {
+                        continue;
+                    };
+                    let png = if raw.kind == db::KIND_IMAGE {
+                        Some(core.images.png_bytes(&raw.content).map_err(|error| {
+                            io::Error::other(format!("图片条目 {id} 无法导出：{error}"))
+                        })?)
+                    } else {
+                        None
+                    };
+                    (raw, png)
+                };
+                let clip = BundleClip {
+                    image_b64: png.map(|bytes| STANDARD.encode(bytes)),
+                    text: (raw.kind == db::KIND_TEXT).then_some(raw.content),
+                    kind: raw.kind,
+                    favorite: raw.favorite,
+                    pinned: raw.pinned,
+                    group_id: raw.group_id,
+                    created_at: raw.created_at,
+                    updated_at: raw.updated_at,
+                };
+                if count > 0 {
+                    write!(w, ",")?;
+                }
+                serde_json::to_writer(&mut w, &clip).map_err(io::Error::other)?;
+                count += 1;
             }
-            serde_json::to_writer(&mut w, &clip).map_err(io::Error::other)?;
-            count += 1;
         }
         write!(w, "]}}")?;
         w.flush()
     })
     .map_err(to_err)?;
     Ok(Some(format!("已导出 {count} 条到 {}", path.display())))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Bundle {
-    app: String,
-    groups: Vec<BundleGroup>,
-    clips: Vec<BundleClip>,
 }
 
 #[tauri::command]
@@ -775,47 +801,8 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_IMPORT_FILE {
         return Err("备份文件过大".into());
     }
-    let data = std::fs::read(&path).map_err(to_err)?;
-    let bundle: Bundle = serde_json::from_slice(&data).map_err(|_| "文件格式不正确".to_string())?;
-    drop(data);
-    if bundle.app != "clipkeep" {
-        return Err("不是 clipkeep 备份文件".into());
-    }
-
-    // Decode every image up front (outside the lock), so the whole import is one short
-    // transaction that either fully applies or rolls back — no half-imports, no orphan files.
-    enum Pending {
-        Text(String),
-        Image(Rgba),
-    }
-    let mut pending = Vec::with_capacity(bundle.clips.len());
-    for c in bundle.clips {
-        match (c.kind.as_str(), c.text, c.image_b64) {
-            (db::KIND_TEXT, Some(text), _) => pending.push((
-                Pending::Text(text),
-                c.favorite,
-                c.pinned,
-                c.group_id,
-                c.created_at,
-                c.updated_at,
-            )),
-            (db::KIND_IMAGE, _, Some(b64)) => {
-                let png = STANDARD
-                    .decode(b64.as_bytes())
-                    .map_err(|_| "图片数据损坏".to_string())?;
-                let rgba = images::decode_png(&png)?;
-                pending.push((
-                    Pending::Image(rgba),
-                    c.favorite,
-                    c.pinned,
-                    c.group_id,
-                    c.created_at,
-                    c.updated_at,
-                ));
-            }
-            _ => continue,
-        }
-    }
+    let core = app.state::<Core>();
+    let staged = backup::stage(std::fs::File::open(&path).map_err(to_err)?, &core.data_dir)?;
 
     let imported = {
         let core = app.state::<Core>();
@@ -827,7 +814,7 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
             .map(|g| (g.name, g.id))
             .collect();
         let mut id_map: HashMap<i64, i64> = HashMap::new();
-        for g in &bundle.groups {
+        for g in &staged.groups {
             let new_id = match existing.get(&g.name) {
                 Some(&id) => id,
                 None => db::create_group(&tx, &g.name).map_err(to_err)?.id,
@@ -835,43 +822,18 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
             id_map.insert(g.id, new_id);
         }
         let mut count = 0usize;
-        for (payload, favorite, pinned, group_id, created_at, updated_at) in pending {
-            let group_id = group_id.and_then(|old| id_map.get(&old).copied());
-            let raw = match payload {
-                Pending::Text(text) => RawClip {
-                    hash: db::text_hash(&text),
-                    size: text.len() as i64,
-                    kind: db::KIND_TEXT.into(),
-                    content: text,
-                    width: None,
-                    height: None,
-                    favorite,
-                    pinned,
-                    group_id,
-                    created_at,
-                    updated_at,
-                },
-                Pending::Image(rgba) => {
-                    let hash = images::hash(&rgba);
-                    let saved = core.images.write(&rgba, &hash)?;
-                    RawClip {
-                        kind: db::KIND_IMAGE.into(),
-                        content: saved.file,
-                        hash: saved.hash,
-                        width: Some(saved.width as i64),
-                        height: Some(saved.height as i64),
-                        size: saved.bytes as i64,
-                        favorite,
-                        pinned,
-                        group_id,
-                        created_at,
-                        updated_at,
-                    }
-                }
-            };
+        for row in serde_json::Deserializer::from_reader(std::io::BufReader::new(&staged.rows))
+            .into_iter::<RawClip>()
+        {
+            let mut raw = row.map_err(to_err)?;
+            raw.group_id = raw.group_id.and_then(|old| id_map.get(&old).copied());
+            if raw.kind == db::KIND_IMAGE {
+                core.images.copy_from(&staged.images, &raw.content)?;
+            }
             db::import_clip(&tx, &raw).map_err(to_err)?;
             count += 1;
         }
+        debug_assert_eq!(count, staged.count);
         tx.commit().map_err(to_err)?;
         let files = db::enforce_storage(&conn, core.max_bytes()).map_err(to_err)?;
         drop(conn);
@@ -924,7 +886,7 @@ fn hide_tray_menu_window(app: &AppHandle) {
     }
     TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
     if let Some(window) = tray_menu_window(app) {
-        let _ = window.hide();
+        let _ = window.destroy();
     }
 }
 
@@ -943,8 +905,28 @@ fn popup_axis(pointer: i32, extent: i32, start: i32, end: i32) -> i32 {
 }
 
 fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
-    let Some(window) = tray_menu_window(app) else {
-        return;
+    let window = match tray_menu_window(app) {
+        Some(window) => window,
+        None => {
+            let Some(config) = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "tray_menu")
+            else {
+                return;
+            };
+            match tauri::WebviewWindowBuilder::from_config(app, config)
+                .and_then(|builder| builder.build())
+            {
+                Ok(window) => window,
+                Err(error) => {
+                    eprintln!("create tray menu failed: {error}");
+                    return;
+                }
+            }
+        }
     };
     TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
     TRAY_MENU_BLUR_GRACE_UNTIL.store(db::now_ms() + 120, Ordering::Relaxed);
@@ -1057,6 +1039,8 @@ fn hide_main(app: &AppHandle) {
             win::log_diagnostic(&format!("hide-main-failed {e}"));
         }
     }
+    #[cfg(target_os = "macos")]
+    let _ = app.hide();
     if let Some(core) = app.try_state::<Core>() {
         core.persist_position();
     }
@@ -1071,7 +1055,10 @@ fn show_main(app: &AppHandle) {
         win::log_diagnostic("show-main-no-window");
         return;
     };
+    #[cfg(windows)]
     win::remember_foreground();
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     place_window(app, &w);
     let _ = w.unminimize();
     // Showing and focusing the WebView can emit a transient blur event.
@@ -1086,9 +1073,12 @@ fn show_main(app: &AppHandle) {
     // The previous nested run_on_main_thread here was redundant and caused
     // re-entrance / blocking that made run_on_main_thread take >300 ms,
     // causing Windows to silently remove the low-level keyboard hook.
+    #[cfg(windows)]
     if let Ok(hwnd) = w.hwnd() {
         win::force_foreground(hwnd.0 as _);
     }
+    #[cfg(not(windows))]
+    let _ = w.set_focus();
     WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     win::log_diagnostic("show-main-complete");
     let _ = w.emit("window-shown", ());
@@ -1263,7 +1253,10 @@ fn open_db(data_dir: &std::path::Path) -> CmdResult<Connection> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(not(windows))]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    builder
         // With WebView2 focused, Tauri's default device filter can starve the host process's
         // WH_KEYBOARD_LL hook. Always keeps Win+V observable inside our own window too.
         .device_event_filter(tauri::DeviceEventFilter::Always)
@@ -1281,14 +1274,21 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let settings_file = SettingsFile::new(&data_dir);
+            #[cfg(windows)]
             win::start_hotkey_diagnostics(&data_dir);
+            #[cfg(not(windows))]
+            win::initialize(&handle);
             let mut settings = settings_file.load();
             if !win::set_hotkey(settings.hotkey_enabled, &settings.hotkey) {
                 settings.hotkey = Settings::default().hotkey;
-                win::set_hotkey(settings.hotkey_enabled, &settings.hotkey);
+                if !win::set_hotkey(settings.hotkey_enabled, &settings.hotkey) {
+                    settings.hotkey_enabled = false;
+                    eprintln!("No global shortcut available; open clipkeep from the tray");
+                }
             }
             clipboard::set_capture_images(settings.capture_images);
 
+            #[cfg(windows)]
             if !cfg!(debug_assertions) && handle.autolaunch().is_enabled().unwrap_or(false) {
                 if let Err(e) = create_autostart_task() {
                     eprintln!("migrating autostart to elevated task failed: {e}");
@@ -1320,7 +1320,9 @@ pub fn run() {
             let monitor_handle = handle.clone();
             clipboard::start_monitor(move |captured| on_local_copy(&monitor_handle, captured));
 
+            #[cfg(windows)]
             let hook_handle = handle.clone();
+            #[cfg(windows)]
             win::install_hotkey_hook(move || {
                 let h = hook_handle.clone();
                 if let Err(e) = hook_handle.run_on_main_thread(move || toggle_main(&h)) {

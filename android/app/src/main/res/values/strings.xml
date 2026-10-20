@@ -1,0 +1,6 @@
+<resources>
+    <string name="page_number">第 %1$d 页</string>
+    <string name="clip_metadata">%1$s%2$s%3$s · %4$s</string>
+    <string name="pinned_prefix">置顶 ·\u0020</string>
+    <string name="favorite_prefix">★ 收藏 ·\u0020</string>
+</resources>

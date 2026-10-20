@@ -1,22 +1,37 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type LanPeer, type Scope } from "./api";
-import SettingsView from "./components/SettingsView.vue";
+const SettingsView = defineAsyncComponent(() => import("./components/SettingsView.vue"));
 import ClipIcon from "./components/ClipIcon.vue";
 
 const page = ref<"list" | "settings">("list");
 const scope = ref<Scope>("all");
 const activeGroup = ref<number | null>(null);
 const query = ref("");
-const clips = ref<Clip[]>([]);
+const clips = shallowRef<Clip[]>([]);
 const groups = ref<Group[]>([]);
 const selected = ref(0);
 const pinnedWindow = ref(false);
 const searchEl = ref<HTMLInputElement | null>(null);
 const listEl = ref<HTMLElement | null>(null);
 const showBackToTop = ref(false);
+// Only mount visible rows and a small overscan; decoded thumbnails leave the DOM on scroll.
+const ROW_HEIGHT = 118;
+const scrollTop = ref(0);
+const viewportHeight = ref(600);
+const startRow = computed(() => Math.max(0, Math.floor(scrollTop.value / ROW_HEIGHT) - 4));
+const endRow = computed(() => Math.min(clips.value.length, startRow.value + Math.ceil(viewportHeight.value / ROW_HEIGHT) + 8));
+const visibleClips = computed(() => clips.value.slice(startRow.value, endRow.value).map((c, index) => ({ c, i: startRow.value + index })));
+const listResize = new ResizeObserver(([entry]) => {
+  if (entry) viewportHeight.value = entry.contentRect.height;
+});
+watch(listEl, (element, previous) => {
+  if (previous) listResize.unobserve(previous);
+  if (element) listResize.observe(element);
+});
 const groupPicker = reactive({ open: false, x: 0, y: 0 });
 const groupPickerSearchEl = ref<HTMLInputElement | null>(null);
 const groupFilter = ref("");
@@ -67,18 +82,36 @@ const unlisteners: UnlistenFn[] = [];
 const groupName = (id: number | null) => groups.value.find((g) => g.id === id)?.name ?? null;
 
 let loadSeq = 0;
+let loading = false;
+let pendingReload: boolean | null = null;
 async function reload(keepScroll = false) {
+  if (!windowShown || page.value !== "list") return;
   const seq = ++loadSeq;
+  if (loading) { pendingReload = keepScroll; return; }
+  loading = true;
   const prev = keepScroll ? (listEl.value?.scrollTop ?? 0) : 0;
-  const rows = await api.listClips(scope.value, activeGroup.value, query.value);
-  if (seq !== loadSeq) return;
-  clips.value = rows;
-  if (selected.value >= rows.length) selected.value = Math.max(0, rows.length - 1);
-  nextTick(() => {
-    if (listEl.value) listEl.value.scrollTop = keepScroll ? prev : restoreScroll;
-    showBackToTop.value = (listEl.value?.scrollTop ?? 0) > 0;
-    restoreScroll = 0;
-  });
+  try {
+    const rows = await api.listClips(scope.value, activeGroup.value, query.value);
+    if (seq !== loadSeq) return;
+    clips.value = rows;
+    if (selected.value >= rows.length) selected.value = Math.max(0, rows.length - 1);
+    nextTick(() => {
+      if (!windowShown || seq !== loadSeq) return;
+      if (listEl.value) listEl.value.scrollTop = keepScroll ? prev : restoreScroll;
+      scrollTop.value = listEl.value?.scrollTop ?? 0;
+      showBackToTop.value = scrollTop.value > 0;
+      restoreScroll = 0;
+    });
+  } catch (error) {
+    if (windowShown && seq === loadSeq) flash(`读取历史失败：${error}`);
+  } finally {
+    loading = false;
+    if (pendingReload !== null) {
+      const keep = pendingReload;
+      pendingReload = null;
+      void reload(keep);
+    }
+  }
 }
 
 async function reloadGroups() {
@@ -142,6 +175,8 @@ function closePreview() {
   } else {
     previewGeneration++;
     previewClip.value = null;
+    fullText.value = "";
+    draftText.value = "";
     nextTick(() => searchEl.value?.focus());
   }
 }
@@ -471,7 +506,13 @@ async function moveTo(groupId: number | null) {
 function move(delta: number) {
   if (!clips.value.length) return;
   selected.value = Math.min(clips.value.length - 1, Math.max(0, selected.value + delta));
-  nextTick(() => listEl.value?.children[selected.value]?.scrollIntoView({ block: "nearest" }));
+  const list = listEl.value;
+  if (!list) return;
+  const top = selected.value * ROW_HEIGHT + 6;
+  if (top < list.scrollTop) list.scrollTop = top;
+  else if (top + ROW_HEIGHT > list.scrollTop + list.clientHeight - 56)
+    list.scrollTop = top + ROW_HEIGHT - list.clientHeight + 56;
+  scrollTop.value = list.scrollTop;
 }
 
 const tabKeys = computed<Array<Scope | number>>(() => ["all", "fav", ...groups.value.map((g) => g.id)]);
@@ -571,6 +612,7 @@ function onKey(e: KeyboardEvent) {
 }
 
 function onScroll() {
+  scrollTop.value = listEl.value?.scrollTop ?? 0;
   showBackToTop.value = (listEl.value?.scrollTop ?? 0) > 0;
   window.clearTimeout(scrollTimer);
   scrollTimer = window.setTimeout(() => saveUi({ scrollTop: listEl.value?.scrollTop ?? 0 }), 200);
@@ -579,6 +621,7 @@ function onScroll() {
 function backToTop() {
   if (!listEl.value) return;
   listEl.value.scrollTop = 0;
+  scrollTop.value = 0;
   selected.value = 0;
   showBackToTop.value = false;
   window.clearTimeout(scrollTimer);
@@ -587,6 +630,14 @@ function backToTop() {
 }
 
 function onHidden() {
+  if (windowShown && listEl.value) saveUi({ scrollTop: listEl.value.scrollTop });
+  pendingReload = null;
+  ++loadSeq; // A late IPC response must not repopulate a hidden window.
+  window.clearTimeout(searchTimer);
+  window.clearTimeout(scrollTimer);
+  clips.value = [];
+  page.value = "list"; // Unmount settings listeners while the window is hidden.
+  scrollTop.value = 0;
   windowShown = false;
   showBackToTop.value = false;
   closeMenus();
@@ -629,11 +680,18 @@ function itemHint(c: Clip, index: number) {
 }
 
 function openSettings() {
+  ++loadSeq;
+  pendingReload = null;
+  window.clearTimeout(searchTimer);
   page.value = "settings";
 }
 function backToList() {
   page.value = "list";
-  nextTick(() => searchEl.value?.focus());
+  nextTick(() => {
+    if (listEl.value) listEl.value.scrollTop = scrollTop.value;
+    void reload(true);
+    searchEl.value?.focus();
+  });
 }
 
 async function onShown() {
@@ -669,13 +727,13 @@ onMounted(async () => {
   if (import.meta.env.PROD) document.addEventListener("contextmenu", preventNativeContextMenu);
   unlisteners.push(
     await listen("clips-changed", () => reload(true)),
-    await listen("groups-changed", reloadGroups),
+    await listen("groups-changed", () => { if (windowShown) void reloadGroups(); }),
     await listen("window-shown", onShown),
     await listen("window-hidden", onHidden),
     await listen("settings-changed", syncSettings),
     await listen<boolean>("capture-paused-changed", (e) => (paused.value = e.payload)),
   );
-  await onShown();
+  if (await getCurrentWindow().isVisible()) await onShown();
   await syncSettings();
 });
 
@@ -692,6 +750,7 @@ onUnmounted(() => {
   window.clearTimeout(noticeTimer);
   window.clearTimeout(searchTimer);
   window.clearTimeout(scrollTimer);
+  listResize.disconnect();
   unlisteners.forEach((u) => u());
 });
 </script>
@@ -737,8 +796,9 @@ onUnmounted(() => {
       <div v-if="notice" class="notice-banner">{{ notice }}</div>
 
       <ul ref="listEl" class="list" @scroll="onScroll">
+        <li v-if="startRow" aria-hidden="true" :style="{ height: `${startRow * ROW_HEIGHT}px` }"></li>
         <li
-          v-for="(c, i) in clips"
+          v-for="{ c, i } in visibleClips"
           :key="c.id"
           class="item"
           :class="{ selected: i === selected, pinned: c.pinned }"
@@ -780,6 +840,7 @@ onUnmounted(() => {
             </div>
           </div>
         </li>
+        <li v-if="endRow < clips.length" aria-hidden="true" :style="{ height: `${(clips.length - endRow) * ROW_HEIGHT}px` }"></li>
         <li v-if="!clips.length" class="empty">
           <ClipIcon :name="scope === 'fav' ? 'star' : scope === 'group' ? 'folder' : 'clipboard'" class="empty-icon" />
           <p>
@@ -1054,6 +1115,8 @@ onUnmounted(() => {
   height: 17px;
 }
 .item {
+  height: 112px;
+  box-sizing: border-box;
   position: relative;
   display: flex;
   align-items: flex-start;

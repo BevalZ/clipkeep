@@ -32,7 +32,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey_enabled: true,
-            hotkey: "win+v".into(),
+            hotkey: if cfg!(windows) {
+                "win+v"
+            } else {
+                "ctrl+shift+v"
+            }
+            .into(),
             capture_images: true,
             remember_position: false,
             keep_on_blur: false,

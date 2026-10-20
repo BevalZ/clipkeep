@@ -1,12 +1,9 @@
 //! Small, opt-in, one-way text transfer over the local network.
 //! The receive code contains a random key; possession of that code authorizes sending.
 
+use crate::lan_wire::{encrypt_frame, make_ack, read_text_frame, verify_ack};
 use crate::{Core, changed, clipboard};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chacha20poly1305::{
-    ChaCha20Poly1305, Key, KeyInit, Nonce,
-    aead::{Aead, Payload},
-};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
@@ -18,10 +15,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const PORT: u16 = 45788;
-const MAGIC: &[u8; 4] = b"CKL1";
-const AAD: &[u8] = b"clipkeep-lan-text-v1";
-const ACK_AAD: &[u8] = b"clipkeep-lan-ack-v1";
-const MAX_CIPHER_BYTES: usize = clipboard::MAX_TEXT_BYTES + 16;
+#[cfg(test)]
+use crate::lan_wire::MAX_CIPHER_BYTES;
 const CODE_PREFIX: &str = "cklan1://";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -336,64 +331,6 @@ fn send_stream(stream: &mut TcpStream, key: &[u8; 32], text: &str) -> Result<(),
     verify_ack(key, &ack)
 }
 
-fn encrypt_frame(key: &[u8; 32], text: &str) -> Result<Vec<u8>, String> {
-    let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
-    let ciphertext = cipher
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: text.as_bytes(),
-                aad: AAD,
-            },
-        )
-        .map_err(|_| "加密失败")?;
-    let mut frame = Vec::with_capacity(20 + ciphertext.len());
-    frame.extend_from_slice(MAGIC);
-    frame.extend_from_slice(&nonce);
-    frame.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&ciphertext);
-    Ok(frame)
-}
-
-fn make_ack(key: &[u8; 32]) -> Result<[u8; 30], String> {
-    let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
-    let receipt = cipher
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: b"OK",
-                aad: ACK_AAD,
-            },
-        )
-        .map_err(|_| "确认加密失败")?;
-    let mut ack = [0u8; 30];
-    ack[..12].copy_from_slice(&nonce);
-    ack[12..].copy_from_slice(&receipt);
-    Ok(ack)
-}
-
-fn verify_ack(key: &[u8; 32], ack: &[u8; 30]) -> Result<(), String> {
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
-    let nonce: [u8; 12] = ack[..12].try_into().unwrap();
-    let receipt = cipher
-        .decrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: &ack[12..],
-                aad: ACK_AAD,
-            },
-        )
-        .map_err(|_| "设备确认无效")?;
-    if receipt != b"OK" {
-        return Err("设备拒绝了文本".into());
-    }
-    Ok(())
-}
-
 fn receive_loop(listener: TcpListener, key: [u8; 32], app: AppHandle, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -417,38 +354,6 @@ fn receive_loop(listener: TcpListener, key: [u8; 32], app: AppHandle, stop: Arc<
             }
         }
     }
-}
-
-fn read_text_frame(reader: &mut impl Read, key: &[u8; 32]) -> Result<String, String> {
-    let mut header = [0u8; 20];
-    reader.read_exact(&mut header).map_err(|e| e.to_string())?;
-    if &header[..4] != MAGIC {
-        return Err("协议版本不匹配".into());
-    }
-    let len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-    if !(16..=MAX_CIPHER_BYTES).contains(&len) {
-        return Err("文本长度超限".into());
-    }
-    let mut ciphertext = vec![0u8; len];
-    reader
-        .read_exact(&mut ciphertext)
-        .map_err(|e| e.to_string())?;
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
-    let nonce: [u8; 12] = header[4..16].try_into().unwrap();
-    let plain = cipher
-        .decrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: &ciphertext,
-                aad: AAD,
-            },
-        )
-        .map_err(|_| "配对码不匹配或数据损坏")?;
-    let text = String::from_utf8(plain).map_err(|_| "文本编码无效")?;
-    if text.trim().is_empty() {
-        return Err("空文本".into());
-    }
-    Ok(text)
 }
 
 fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Result<(), String> {
