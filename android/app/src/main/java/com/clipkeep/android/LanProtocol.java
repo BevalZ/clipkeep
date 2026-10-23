@@ -18,7 +18,7 @@ public final class LanProtocol {
     public static final long MAX_IMAGE_PIXELS = 16_000_000;
     // At most one platform DNS lookup can remain in flight after a timeout.
     private static final ThreadPoolExecutor DNS = new ThreadPoolExecutor(0, 1, 10, TimeUnit.SECONDS,
-        new SynchronousQueue<>(), task -> { Thread t = new Thread(task, "clipkeep-dns"); t.setDaemon(true); return t; });
+        new ArrayBlockingQueue<>(1), task -> { Thread t = new Thread(task, "clipkeep-dns"); t.setDaemon(true); return t; });
     public static final String PREFIX = "cklan1://";
     private static final byte[] AAD = "clipkeep-lan-text-v1".getBytes(StandardCharsets.UTF_8);
     private static final byte[] ACK_AAD = "clipkeep-lan-ack-v1".getBytes(StandardCharsets.UTF_8);
@@ -90,7 +90,7 @@ public final class LanProtocol {
         catch (TimeoutException error) { throw new IOException("DNS 查询超时，请检查 Tailscale / MagicDNS", error); }
         catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException("DNS 查询已取消", error); }
         catch (ExecutionException error) { throw new IOException("无法解析设备名称，请检查 Tailscale / MagicDNS", error.getCause()); }
-        finally { lookup.cancel(true); }
+        finally { lookup.cancel(true); if (lookup instanceof Runnable) DNS.remove((Runnable)lookup); }
     }
 
     public static byte[] newKey() { byte[] key = new byte[32]; RANDOM.nextBytes(key); return key; }

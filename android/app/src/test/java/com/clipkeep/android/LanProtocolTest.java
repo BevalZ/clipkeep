@@ -70,6 +70,8 @@ public class LanProtocolTest {
         assertThrows(Exception.class, () -> LanProtocol.readMessage(new ByteArrayInputStream(request), key()));
         assertThrows(IOException.class, () -> LanProtocol.writePayload(new ByteArrayOutputStream(), key(), 0x434b4831, new byte[31]));
         assertThrows(IOException.class, () -> LanProtocol.restrictedAddress(new java.net.InetAddress[]{java.net.InetAddress.getByName("8.8.8.8"), java.net.InetAddress.getByName("::1")}));
+        // Cached lookups may finish before the worker returns to its queue.
+        for (int i = 0; i < 20; i++) assertTrue(LanProtocol.allowed(LanProtocol.resolve("localhost")));
         assertEquals("100.64.0.1", LanProtocol.restrictedAddress(new java.net.InetAddress[]{java.net.InetAddress.getByName("8.8.8.8"), java.net.InetAddress.getByName("100.64.0.1")}).getHostAddress());
     }
 
