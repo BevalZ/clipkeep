@@ -8,7 +8,7 @@ import org.json.JSONObject;
 
 /** Service-owned, single-connection receiver with absolute deadlines and authenticated ACKs. */
 final class LanReceiver implements AutoCloseable {
-    interface Listener { void received(long id); void failed(Exception error); }
+    interface Listener { void received(long id); void failed(Exception error); default void stopped(Exception error) { failed(error); } }
     private final ServerSocket server;
     private final DatagramSocket discovery;
     private final byte[] key;
@@ -33,7 +33,10 @@ final class LanReceiver implements AutoCloseable {
     }
     private void receive() {
         while (!closed) {
-            try (Socket socket = server.accept()) {
+            Socket accepted;
+            try { accepted = server.accept(); }
+            catch (IOException error) { if (!closed) listener.stopped(error); return; }
+            try (Socket socket = accepted) {
                 synchronized (this) { if (closed) return; active = socket; }
                 if (!LanProtocol.allowed(socket.getInetAddress())) continue;
                 socket.setSoTimeout(5000);
@@ -41,6 +44,11 @@ final class LanReceiver implements AutoCloseable {
                 try {
                     LanProtocol.Message message = LanProtocol.readMessage(socket.getInputStream(), key);
                     if (closed) return;
+                    if (message.probe()) {
+                        LanProtocol.writePayload(socket.getOutputStream(), key, 0x434b5231, message.bytes);
+                        continue;
+                    }
+                    if (message.probeReply()) throw new IOException("非预期的探测响应");
                     long id = -1;
                     if (message.pair()) {
                         JSONObject pair = new JSONObject(message.text());

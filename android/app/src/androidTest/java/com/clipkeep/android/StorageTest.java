@@ -90,6 +90,20 @@ public class StorageTest {
             assertEquals(1, store.list("", false, 0).size());
         }
     }
+    @Test public void testAuthenticatedProbeNeverChangesHistoryOrPairing() throws Exception {
+        byte[] key = LanProtocol.newKey(); long id = store.save("keep existing");
+        String peers = LanSettings.peers(getContext()).toString();
+        java.util.concurrent.atomic.AtomicInteger changes = new java.util.concurrent.atomic.AtomicInteger();
+        try (LanReceiver receiver = new LanReceiver(getContext(), key, store, new LanReceiver.Listener() {
+            public void received(long saved) { changes.incrementAndGet(); }
+            public void failed(Exception error) { }
+        })) {
+            Transfer.probe(LanProtocol.parseCode("cklan1://127.0.0.1:45788/" + Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
+            assertEquals(0, changes.get()); assertEquals(1, store.list("", false, 0).size());
+            assertEquals(id, store.list("", false, 0).get(0).id);
+            assertEquals(peers, LanSettings.peers(getContext()).toString());
+        }
+    }
     @Test public void testDeviceCryptoProvider() throws Exception {
         ByteArrayOutputStream frame = new ByteArrayOutputStream(); byte[] key = LanProtocol.newKey();
         LanProtocol.writeText(frame, key, "Android 设备加密测试");

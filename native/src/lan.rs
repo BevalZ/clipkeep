@@ -101,16 +101,18 @@ fn decode_key(encoded: &str) -> Result<[u8; 32], String> {
     bytes.try_into().map_err(|_| "配对码无效".into())
 }
 
-fn parse_code(code: &str) -> Result<(SocketAddrV4, String), String> {
+fn parse_code(code: &str) -> Result<(String, String), String> {
     let body = code
         .trim()
         .strip_prefix(CODE_PREFIX)
         .ok_or("配对码格式无效")?;
     let (address, key) = body.split_once('/').ok_or("配对码格式无效")?;
-    let address: SocketAddrV4 = address.parse().map_err(|_| "配对地址无效")?;
-    if !allowed_ip(*address.ip()) || address.port() != PORT {
-        return Err("仅支持局域网或 Tailnet IPv4 地址和默认端口".into());
+    let address = address.to_ascii_lowercase();
+    let (host, port) = address.split_once(':').ok_or("配对地址无效")?;
+    if port != "45788" {
+        return Err("配对端口无效".into());
     }
+    crate::lan_address::validate_host(host)?;
     decode_key(key)?;
     Ok((address, key.to_owned()))
 }
@@ -335,7 +337,6 @@ impl LanService {
         }
         let (address, key) = parse_code(code)?;
         let mut config = self.config.lock().map_err(|e| e.to_string())?.clone();
-        let address = address.to_string();
         if let Some(peer) = config.peers.iter_mut().find(|p| p.address == address) {
             peer.name = name.to_owned();
             peer.key = key;
@@ -419,11 +420,21 @@ impl LanService {
             .ok_or("设备未配对")?;
         let key = decode_key(&peer.key)?;
         let (target, _) = parse_code(&format!("{CODE_PREFIX}{}/{}", peer.address, peer.key))?;
-        let mut stream =
-            TcpStream::connect_timeout(&SocketAddr::V4(target), Duration::from_secs(3))
-                .map_err(|e| format!("连接设备失败：{e}"))?;
+        let target = crate::lan_address::resolve(&target)?;
+        let mut stream = connect_retry(target)?;
         transfer(&mut stream, &key, &frame(&key)?)
     }
+}
+
+fn connect_retry(target: SocketAddr) -> Result<TcpStream, String> {
+    for attempt in 0..3 {
+        match TcpStream::connect_timeout(&target, Duration::from_millis(2500)) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if attempt == 2 => return Err(format!("连接设备失败：{error}")),
+            Err(_) => thread::sleep(Duration::from_millis(if attempt == 0 { 350 } else { 1000 })),
+        }
+    }
+    unreachable!()
 }
 
 fn discovery_loop(socket: UdpSocket, stop: Arc<AtomicBool>) {
@@ -453,7 +464,7 @@ fn discovery_loop(socket: UdpSocket, stop: Arc<AtomicBool>) {
             continue;
         }
         budget -= 1;
-        let reply = serde_json::json!({"protocol":"CKD1", "nonce":std::str::from_utf8(&buffer[6..38]).unwrap(), "name":name, "port":PORT, "images":true, "pair":true});
+        let reply = serde_json::json!({"protocol":"CKD1", "nonce":std::str::from_utf8(&buffer[6..38]).unwrap(), "name":name, "port":PORT, "images":true, "pair":true, "probe":true});
         let _ = socket.send_to(reply.to_string().as_bytes(), source);
     }
 }
@@ -546,6 +557,12 @@ fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Resul
         .copy_received;
     let message = read_message(&mut DeadlineIo::new(stream), key)?;
     match message {
+        Message::Probe(challenge) => {
+            return stream
+                .write_all(&encrypt_payload(key, b"CKR1", &challenge)?)
+                .map_err(|e| e.to_string());
+        }
+        Message::ProbeReply(_) => return Err("非预期的探测响应".into()),
         Message::Text(text) => {
             if text.contains(CODE_PREFIX) {
                 return Err("配对码不能进入历史".into());

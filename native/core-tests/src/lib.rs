@@ -10,3 +10,6 @@ mod db;
 pub mod images;
 #[path = "../../src/lan_wire.rs"]
 mod lan_wire;
+
+#[path = "../../src/lan_address.rs"]
+mod lan_address;

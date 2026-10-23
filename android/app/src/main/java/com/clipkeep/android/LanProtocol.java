@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.*;
 import java.security.*;
 import java.util.*;
+import java.util.concurrent.*;
 import javax.crypto.Cipher;
 import javax.crypto.spec.*;
 
@@ -15,6 +16,9 @@ public final class LanProtocol {
     public static final int MAX_TEXT_BYTES = 2 * 1024 * 1024;
     public static final int MAX_IMAGE_BYTES = 8 * 1024 * 1024;
     public static final long MAX_IMAGE_PIXELS = 16_000_000;
+    // At most one platform DNS lookup can remain in flight after a timeout.
+    private static final ThreadPoolExecutor DNS = new ThreadPoolExecutor(0, 1, 10, TimeUnit.SECONDS,
+        new SynchronousQueue<>(), task -> { Thread t = new Thread(task, "clipkeep-dns"); t.setDaemon(true); return t; });
     public static final String PREFIX = "cklan1://";
     private static final byte[] AAD = "clipkeep-lan-text-v1".getBytes(StandardCharsets.UTF_8);
     private static final byte[] ACK_AAD = "clipkeep-lan-ack-v1".getBytes(StandardCharsets.UTF_8);
@@ -26,7 +30,7 @@ public final class LanProtocol {
         private Peer(String address, byte[] key) { this.address = address; this.key = key; }
         public String code() { return PREFIX + address + "/" + Base64.getUrlEncoder().withoutPadding().encodeToString(key); }
         public InetSocketAddress socketAddress() throws IOException {
-            return new InetSocketAddress(InetAddress.getByName(address.substring(0, address.indexOf(':'))), PORT);
+            return new InetSocketAddress(resolve(address.substring(0, address.indexOf(':'))), PORT);
         }
     }
 
@@ -45,21 +49,48 @@ public final class LanProtocol {
             if (parts.length != 2 || !parts[0].endsWith(":" + PORT)) throw new IllegalArgumentException();
             String host = parts[0].substring(0, parts[0].indexOf(':'));
             if (!parts[0].equals(host + ":" + PORT)) throw new IllegalArgumentException();
-            String[] octets = host.split("\\.", -1);
-            if (octets.length != 4) throw new IllegalArgumentException();
-            byte[] ip = new byte[4];
-            for (int i = 0; i < 4; i++) {
-                if (!octets[i].matches("0|[1-9][0-9]{0,2}")) throw new IllegalArgumentException();
-                int value = Integer.parseInt(octets[i]);
-                if (value > 255) throw new IllegalArgumentException();
-                ip[i] = (byte) value;
-            }
-            if (!allowed(InetAddress.getByAddress(ip))) throw new IllegalArgumentException();
+            validateHost(host);
             if (!parts[1].matches("[A-Za-z0-9_-]{43}")) throw new IllegalArgumentException();
             byte[] key = Base64.getUrlDecoder().decode(parts[1]);
             if (key.length != 32) throw new IllegalArgumentException();
-            return new Peer(parts[0], key);
-        } catch (IllegalArgumentException e) { throw new IOException("配对码无效：仅支持局域网或 Tailnet IPv4 和端口 45788", e); }
+            return new Peer(parts[0].toLowerCase(Locale.ROOT), key);
+        } catch (IllegalArgumentException e) { throw new IOException("配对码无效：支持私网 IPv4、MagicDNS 名称和端口 45788", e); }
+    }
+
+    static void validateHost(String host) throws IOException {
+        if (host.matches("[0-9.]+")) {
+            String[] octets = host.split("\\.", -1);
+            if (octets.length != 4) throw new IOException("IPv4 地址无效");
+            byte[] ip = new byte[4];
+            for (int i = 0; i < 4; i++) {
+                if (!octets[i].matches("0|[1-9][0-9]{0,2}")) throw new IOException("IPv4 地址无效");
+                int value = Integer.parseInt(octets[i]);
+                if (value > 255) throw new IOException("IPv4 地址无效");
+                ip[i] = (byte)value;
+            }
+            if (!allowed(InetAddress.getByAddress(ip))) throw new IOException("仅允许私网或 Tailnet IPv4");
+            return;
+        }
+        String name = host.toLowerCase(Locale.ROOT);
+        if (name.length() > 253 || (name.contains(".") && !name.endsWith(".ts.net"))) throw new IOException("请输入 MagicDNS 短名称或 .ts.net 完整名称");
+        for (String label : name.split("\\.", -1))
+            if (!label.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")) throw new IOException("MagicDNS 名称无效");
+    }
+    static InetAddress restrictedAddress(InetAddress[] addresses) throws IOException {
+        for (InetAddress address : addresses) if (allowed(address)) return address;
+        throw new IOException("名称未解析到私网或 Tailnet IPv4，请检查 VPN / MagicDNS");
+    }
+    static InetAddress resolve(String host) throws IOException {
+        validateHost(host);
+        if (host.matches("[0-9.]+")) return InetAddress.getByName(host);
+        Future<InetAddress[]> lookup;
+        try { lookup = DNS.submit(() -> InetAddress.getAllByName(host)); }
+        catch (RejectedExecutionException error) { throw new IOException("DNS 查询尚未结束，请稍后重试", error); }
+        try { return restrictedAddress(lookup.get(3, TimeUnit.SECONDS)); }
+        catch (TimeoutException error) { throw new IOException("DNS 查询超时，请检查 Tailscale / MagicDNS", error); }
+        catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException("DNS 查询已取消", error); }
+        catch (ExecutionException error) { throw new IOException("无法解析设备名称，请检查 Tailscale / MagicDNS", error.getCause()); }
+        finally { lookup.cancel(true); }
     }
 
     public static byte[] newKey() { byte[] key = new byte[32]; RANDOM.nextBytes(key); return key; }
@@ -88,20 +119,25 @@ public final class LanProtocol {
                 .decode(ByteBuffer.wrap(bytes)).toString();
         }
         public boolean image() { return magic == 0x434b4931; }
+        public boolean probeReply() { return magic == 0x434b5231; }
+        public boolean probe() { return magic == 0x434b4831; }
         public boolean pair() { return magic == 0x434b5031; }
     }
     private static int limit(int magic) throws IOException {
         if (magic == 0x434b4c31) return MAX_TEXT_BYTES;
         if (magic == 0x434b4931) return MAX_IMAGE_BYTES;
         if (magic == 0x434b5031) return 1024;
+        if (magic == 0x434b4831 || magic == 0x434b5231) return 32;
         throw new IOException("协议版本不匹配，请更新接收端");
     }
     private static byte[] aad(int magic) throws IOException {
         limit(magic);
+        if (magic == 0x434b5231) return "clipkeep-lan-probe-reply-v1".getBytes(StandardCharsets.UTF_8);
+        if (magic == 0x434b4831) return "clipkeep-lan-probe-v1".getBytes(StandardCharsets.UTF_8);
         return magic == 0x434b4c31 ? AAD : (magic == 0x434b4931 ? "clipkeep-lan-image-v1" : "clipkeep-lan-pair-v1").getBytes(StandardCharsets.UTF_8);
     }
     public static void writePayload(OutputStream stream, byte[] key, int magic, byte[] plain) throws IOException, GeneralSecurityException {
-        if (plain.length == 0 || plain.length > limit(magic)) throw new IOException("内容长度超限");
+        if (((magic == 0x434b4831 || magic == 0x434b5231) && plain.length != 32) || plain.length == 0 || plain.length > limit(magic)) throw new IOException("内容长度超限");
         byte[] nonce = nonce();
         byte[] encrypted = cipher(Cipher.ENCRYPT_MODE, key, nonce, aad(magic)).doFinal(plain);
         DataOutputStream out = new DataOutputStream(stream);
@@ -116,7 +152,8 @@ public final class LanProtocol {
         byte[] encrypted = new byte[length]; in.readFully(encrypted);
         byte[] plain = cipher(Cipher.DECRYPT_MODE, key, nonce, aad(magic)).doFinal(encrypted);
         Message message = new Message(magic, plain);
-        if (!message.image() && message.text().trim().isEmpty()) throw new IOException("空文本");
+        if ((message.probe() || message.probeReply()) && plain.length != 32) throw new IOException("探测长度无效");
+        if (!message.image() && !message.probe() && !message.probeReply() && message.text().trim().isEmpty()) throw new IOException("空文本");
         return message;
     }
     public static String readText(InputStream stream, byte[] key) throws IOException, GeneralSecurityException {

@@ -17,6 +17,8 @@ pub(crate) enum Message {
     Text(String),
     Image(Vec<u8>),
     Pair(String),
+    Probe([u8; 32]),
+    ProbeReply([u8; 32]),
 }
 pub(crate) fn allowed_ip(ip: std::net::Ipv4Addr) -> bool {
     let octets = ip.octets();
@@ -29,6 +31,8 @@ fn format(magic: &[u8]) -> Result<(&'static [u8], usize), String> {
     match magic {
         b"CKL1" => Ok((AAD, MAX_TEXT_BYTES)),
         b"CKI1" => Ok((b"clipkeep-lan-image-v1", MAX_IMAGE_BYTES)),
+        b"CKH1" => Ok((b"clipkeep-lan-probe-v1", 32)),
+        b"CKR1" => Ok((b"clipkeep-lan-probe-reply-v1", 32)),
         b"CKP1" => Ok((b"clipkeep-lan-pair-v1", 1024)),
         _ => Err("协议版本不匹配".into()),
     }
@@ -45,7 +49,10 @@ pub(crate) fn encrypt_payload(
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let (aad, limit) = format(magic)?;
-    if bytes.is_empty() || bytes.len() > limit {
+    if bytes.is_empty()
+        || bytes.len() > limit
+        || (matches!(magic, b"CKH1" | b"CKR1") && bytes.len() != 32)
+    {
         return Err("内容长度超限".into());
     }
     let mut nonce = [0u8; 12];
@@ -124,6 +131,14 @@ pub(crate) fn read_message(reader: &mut impl Read, key: &[u8; 32]) -> Result<Mes
     cipher
         .decrypt_in_place(&Nonce::from(nonce), aad, &mut ciphertext)
         .map_err(|_| "配对码不匹配或数据损坏")?;
+    if matches!(&header[..4], b"CKH1" | b"CKR1") {
+        let challenge = ciphertext.try_into().map_err(|_| "探测长度无效")?;
+        return Ok(if &header[..4] == b"CKH1" {
+            Message::Probe(challenge)
+        } else {
+            Message::ProbeReply(challenge)
+        });
+    }
     if &header[..4] == b"CKI1" {
         return Ok(Message::Image(ciphertext));
     }
@@ -149,6 +164,28 @@ mod tests {
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
+    #[test]
+    fn independent_probe_vectors_and_response_domain_separation() {
+        let key = std::array::from_fn(|i| i as u8);
+        let mut request = hex(
+            "434b4831000102030405060708090a0b0000003089fa0a032d12a347bf8a35f89410006cd961a0f44561bbaefe8e35de69ddb8230a2c9c54999acd30f0c6eb5d4cdc7484",
+        );
+        let reply = hex(
+            "434b5231000102030405060708090a0b0000003089fa0a032d12a347bf8a35f89410006cd961a0f44561bbaefe8e35de69ddb8235dbe86d7d3ae38edcdb1e4ce757de6a7",
+        );
+        assert_eq!(
+            read_message(&mut request.as_slice(), &key).unwrap(),
+            Message::Probe(key)
+        );
+        assert_eq!(
+            read_message(&mut reply.as_slice(), &key).unwrap(),
+            Message::ProbeReply(key)
+        );
+        request[2] = b'R';
+        assert!(read_message(&mut request.as_slice(), &key).is_err());
+        assert!(encrypt_payload(&key, b"CKH1", &[0; 31]).is_err());
+    }
+
     #[test]
     fn image_pair_and_tailnet_protocol() {
         let key = std::array::from_fn(|i| i as u8);

@@ -47,9 +47,12 @@ def receive():
   try:
    with s:
     s.settimeout(10);h=exact(s,20);body=exact(s,int.from_bytes(h[16:20],'big'))
-    aad={b'CKP1':b'clipkeep-lan-pair-v1',b'CKI1':b'clipkeep-lan-image-v1',b'CKL1':b'clipkeep-lan-text-v1'}[h[:4]]
+    aad={b'CKP1':b'clipkeep-lan-pair-v1',b'CKI1':b'clipkeep-lan-image-v1',b'CKL1':b'clipkeep-lan-text-v1',b'CKH1':b'clipkeep-lan-probe-v1'}[h[:4]]
     plain=cipher.decrypt(h[4:16],body,aad);received.append((h[:4],plain))
-    nonce=os.urandom(12);s.sendall(nonce+cipher.encrypt(nonce,b'OK',b'clipkeep-lan-ack-v1'))
+    nonce=os.urandom(12)
+    if h[:4]==b'CKH1':
+     reply=cipher.encrypt(nonce,plain,b'clipkeep-lan-probe-reply-v1');s.sendall(b'CKR1'+nonce+len(reply).to_bytes(4,'big')+reply)
+    else:s.sendall(nonce+cipher.encrypt(nonce,b'OK',b'clipkeep-lan-ack-v1'))
   except Exception as e:errors.append(str(e))
 threading.Thread(target=discover,daemon=True).start();threading.Thread(target=receive,daemon=True).start()
 try:
@@ -59,6 +62,10 @@ try:
  assert received and received[0][0]==b'CKP1',received
  phonekey=base64.urlsafe_b64decode(json.loads(received[0][1])['key']+'=');pcipher=ChaCha20Poly1305(phonekey)
  print('Scan -> select -> authenticated mutual pairing passed',flush=True)
+ click('设备');click('管理已配对设备');click('Desktop-test');click('测试连接');time.sleep(1)
+ assert any(m==b'CKH1' for m,p in received),received
+ assert not any('clipkeep-lan-probe' in n.get('text','') for n in nodes())
+ print('Android connection-test UI and authenticated challenge reply passed',flush=True)
  click('设备');click('复制与同步设置');click('收到后复制到系统剪贴板');click('完成')
  run('forward','tcp:45789','tcp:45788');run('shell','input','keyevent','KEYCODE_HOME');time.sleep(1)
  def send(magic,plain):
@@ -68,8 +75,28 @@ try:
  send(b'CKL1','后台文本 中文 😀'.encode());png=test_png;send(b'CKI1',png)
  service=run('shell','dumpsys','activity','services','com.clipkeep.android').decode();assert 'isForeground=true' in service
  print('Background text + image receive and authenticated ACK passed',flush=True)
+ # Keep the screen locked, then test a network transition and a system process kill.
+ run('shell','input','keyevent','KEYCODE_SLEEP');time.sleep(.5)
+ send(b'CKL1','锁屏接收'.encode())
+ run('shell','svc','wifi','disable');run('shell','svc','data','disable');time.sleep(1)
+ run('shell','svc','wifi','enable');run('shell','svc','data','enable');time.sleep(2)
+ send(b'CKL1','网络切换后接收'.encode())
+ oldpid=run('shell','pidof','com.clipkeep.android').decode().strip()
+ run('shell','run-as','com.clipkeep.android','kill','-9',oldpid)
+ until=time.monotonic()+45;restored=False
+ while time.monotonic()<until:
+  time.sleep(1)
+  try:
+   newpid=run('shell','pidof','com.clipkeep.android').decode().strip()
+   if newpid and newpid!=oldpid:
+    send(b'CKL1','系统重建后接收'.encode());restored=True;break
+  except Exception:pass
+ assert restored,'Sticky foreground receiver did not recover'
+ print('Locked-screen receive, Wi-Fi/data transition and sticky process recovery passed',flush=True)
+ run('shell','input','keyevent','KEYCODE_WAKEUP');run('shell','wm','dismiss-keyguard')
+
  run('shell','am','start','-n','com.clipkeep.android/.MainActivity');time.sleep(1)
- assert any(n.get('text')=='[图片]' for n in nodes());assert any('后台文本' in n.get('text','') for n in nodes())
+ assert any(n.get('text')=='[图片]' for n in nodes());assert any('系统重建后接收' in n.get('text','') for n in nodes())
  # Copy received image URI back into history to exercise provider URI reads and de-duplication.
  click('粘贴保存');time.sleep(1)
  for n in nodes():
@@ -82,7 +109,11 @@ try:
  try:send(b'CKL1',b'should fail');raise AssertionError('still receiving')
  except (ConnectionError,OSError,Exception) as e:
   if isinstance(e,AssertionError):raise
+ # A persisted explicit stop must survive a new app process.
+ run('shell','am','force-stop','com.clipkeep.android');run('shell','am','start','-n','com.clipkeep.android/.MainActivity');time.sleep(1)
+ assert 'isForeground=true' not in run('shell','dumpsys','activity','services','com.clipkeep.android').decode()
  assert not errors,errors
  print('Explicit stop closes receiver; E2E passed',flush=True)
 finally:
  stop=True;server.close();udp.close()
+ run('shell','svc','wifi','enable');run('shell','svc','data','enable');run('shell','input','keyevent','KEYCODE_WAKEUP')

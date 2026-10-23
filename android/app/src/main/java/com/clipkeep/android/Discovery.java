@@ -26,8 +26,10 @@ final class Discovery {
         }
         String[] candidates = hosts.trim().isEmpty() ? new String[0] : hosts.trim().split("[\\s,;]+", -1);
         if (candidates.length > 32) throw new IOException("一次最多探测 32 台 Tailnet 设备");
+        long resolutionUntil = System.nanoTime() + 8_000_000_000L;
         for (String host : candidates) {
-            // Literal IPv4 keeps discovery bounded; Android cannot enumerate Tailscale's private peer API.
+            if (System.nanoTime() > resolutionUntil) throw new IOException("名称解析耗时过长，请分批扫描");
+            // Explicit names only; never enumerate the entire Tailnet.
             String code = LanProtocol.PREFIX + host + ":" + LanProtocol.PORT + "/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
             targets.add(LanProtocol.parseCode(code).socketAddress().getAddress());
         }
@@ -64,7 +66,7 @@ final class Discovery {
                 if (!query.matches("CKD1\\? [a-fA-F0-9]{32}")) continue;
                 budget--;
                 byte[] response = new JSONObject().put("protocol", "CKD1").put("nonce", query.substring(6))
-                    .put("name", name).put("port", LanProtocol.PORT).put("images", true).put("pair", true).toString().getBytes(StandardCharsets.UTF_8);
+                    .put("name", name).put("port", LanProtocol.PORT).put("images", true).put("pair", true).put("probe", true).toString().getBytes(StandardCharsets.UTF_8);
                 socket.send(new DatagramPacket(response, response.length, packet.getSocketAddress()));
             } catch (Exception ignored) { if (socket.isClosed()) return; }
         }

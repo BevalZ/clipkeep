@@ -4,6 +4,7 @@ mod clipboard;
 mod db;
 mod images;
 mod lan;
+mod lan_address;
 mod lan_wire;
 mod settings;
 #[cfg(windows)]

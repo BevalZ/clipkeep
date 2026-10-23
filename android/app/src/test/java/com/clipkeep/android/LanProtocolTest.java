@@ -52,11 +52,25 @@ public class LanProtocolTest {
         assertThrows(IOException.class, () -> LanProtocol.readText(new ByteArrayInputStream(frame), key()));
         assertThrows(IOException.class, () -> LanProtocol.readText(new ByteArrayInputStream(new byte[]{'C'}), key()));
     }
-    @Test public void pairingOnlyAcceptsLiteralLocalAddresses() throws Exception {
+    @Test public void pairingAcceptsPrivateAddressesAndMagicDnsNames() throws Exception {
         String suffix = ":45788/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
         assertEquals("192.168.1.2:45788", LanProtocol.parseCode("cklan1://192.168.1.2" + suffix).address);
-        for (String host : new String[]{"8.8.8.8", "example.com", "192.168.1.256", "192.168.01.2", "[::1]", "192.168.1.2:123"}) {
+        assertEquals("desktop.tail123.ts.net:45788", LanProtocol.parseCode("cklan1://DESKTOP.tail123.ts.net" + suffix).address);
+        assertEquals("desktop:45788", LanProtocol.parseCode("cklan1://desktop" + suffix).address);
+        for (String host : new String[]{"8.8.8.8", "example.com", "desktop.ts.net.evil.com", "a..ts.net", "-bad", "bad-", "127.1", "192.168.1.256", "192.168.01.2", "[::1]", "192.168.1.2:123"}) {
             assertThrows(IOException.class, () -> LanProtocol.parseCode("cklan1://" + host + suffix));
         }
     }
+    @Test public void probeVectorsRequireDistinctResponseAndRestrictedResolution() throws Exception {
+        byte[] request = hex("434b4831000102030405060708090a0b0000003089fa0a032d12a347bf8a35f89410006cd961a0f44561bbaefe8e35de69ddb8230a2c9c54999acd30f0c6eb5d4cdc7484");
+        byte[] reply = hex("434b5231000102030405060708090a0b0000003089fa0a032d12a347bf8a35f89410006cd961a0f44561bbaefe8e35de69ddb8235dbe86d7d3ae38edcdb1e4ce757de6a7");
+        assertTrue(LanProtocol.readMessage(new ByteArrayInputStream(request), key()).probe());
+        assertTrue(LanProtocol.readMessage(new ByteArrayInputStream(reply), key()).probeReply());
+        request[2] = 'R';
+        assertThrows(Exception.class, () -> LanProtocol.readMessage(new ByteArrayInputStream(request), key()));
+        assertThrows(IOException.class, () -> LanProtocol.writePayload(new ByteArrayOutputStream(), key(), 0x434b4831, new byte[31]));
+        assertThrows(IOException.class, () -> LanProtocol.restrictedAddress(new java.net.InetAddress[]{java.net.InetAddress.getByName("8.8.8.8"), java.net.InetAddress.getByName("::1")}));
+        assertEquals("100.64.0.1", LanProtocol.restrictedAddress(new java.net.InetAddress[]{java.net.InetAddress.getByName("8.8.8.8"), java.net.InetAddress.getByName("100.64.0.1")}).getHostAddress());
+    }
+
 }

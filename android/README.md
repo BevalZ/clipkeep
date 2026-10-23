@@ -1,4 +1,4 @@
-# clipkeep Android 0.3.0
+# clipkeep Android 0.3.1
 
 Android 9（API 28）及以上。原生 Java、系统控件、SQLite，无 WebView 和生产环境第三方依赖。支持文本/图片历史、搜索、收藏、置顶、系统分享、图片选择、复制与局域网加密互传。
 
@@ -13,15 +13,17 @@ Android 9（API 28）及以上。原生 Java、系统控件、SQLite，无 WebVi
 
 ### Tailnet
 
-手机和电脑分别安装并连接 Tailscale，使用各自的 **100.64.0.0/10 IPv4 地址**配对。也支持使用私网 IPv4 的其他 VPN。手机上的 Tailscale 必须允许 clipkeep 的流量进入 VPN；Tailnet ACL 和系统防火墙需允许 **TCP/UDP 45788**。本客户端不会创建或管理 VPN，也不需要 Tailscale 管理密钥。
+手机和电脑分别安装并连接 Tailscale，使用各自的 **100.64.0.0/10 IPv4 地址**配对。0.3.1 起，扫描目标和手动配对码地址也支持 MagicDNS 短名称（如 `desktop`）及 `.ts.net` 完整名称；将配对码中的 IPv4 替换为该设备名称即可，密钥和端口不变。名称在工作线程解析，单次 DNS 等待最多 3 秒，只连接解析得到的私网 / Tailnet IPv4，不接受公网地址或 IPv6。旧版客户端仍使用 IPv4 配对。也支持使用私网 IPv4 的其他 VPN。手机上的 Tailscale 必须允许 clipkeep 的流量进入 VPN；Tailnet ACL 和系统防火墙需允许 **TCP/UDP 45788**。本客户端不会创建或管理 VPN，也不需要 Tailscale 管理密钥。
 
-Tailnet 不转发 Wi-Fi 广播，Android 也无法直接读取另一个应用中的 Tailscale 设备列表。因此在扫描框填入目标的 Tailscale IPv4 地址，多台用空格分隔（最多 32 台），点击扫描即可探测响应客户端；目标列表会保留。当前不支持自动枚举整个 Tailnet、MagicDNS 名称、IPv6 或公网地址。Wi-Fi AP 隔离、VPN 路由、ACL 或防火墙阻断时扫描可能为空，也可手动输入配对码。
+Tailnet 不转发 Wi-Fi 广播，Android 也无法直接读取另一个应用中的 Tailscale 设备列表。因此在扫描框填入目标的 Tailscale IPv4 或 MagicDNS 名称，多台用空格分隔（最多 32 台），点击扫描即可探测响应客户端；目标列表会保留。当前不支持自动枚举整个 Tailnet、IPv6 或公网地址。Wi-Fi AP 隔离、VPN 路由、ACL 或防火墙阻断时扫描可能为空，也可手动输入配对码。
 
 ### 后台与双向复制
 
 - Android 后台接收使用用户主动开启的 `connectedDevice` 前台服务，显示**低优先级、无声常驻通知**，退到主屏幕不再停止接收。通知有“停止接收”按钮；应用内也可关闭。没有开机自启，也不获取无限 wakelock。
+- 开关会持久保存，系统重建服务时按已保存状态恢复；主动停止后不自动重启。网络变化会更新无声通知，监听保持可用；接收监听意外退出或端口绑定失败时按 1 / 3 / 6 秒最多重试三次，新网络可再次触发恢复。设备 → 后台运行与省电设置提供系统电池优化入口；系统强制停止后需手动打开应用，不保证绕过 Doze 或厂商进程管理。
+- 设备 → 管理已配对设备 → 测试连接：加密随机挑战验证当前密钥和响应端，不写历史、不改剪贴板或配对列表。接收端需 0.3.1+；老版本可继续传输文本/图片，但不能使用此测试。
 - Android → 设备：可主动“粘贴保存”、从其他应用分享文本/图片、选择图片，再发送。设备 → 复制与同步设置中可开启**前台监听**并选择自动发送目标，开关默认关闭。
-- Windows → 设备：设置中可选择“本机复制后自动发送”的目标，默认关闭。连续复制时保留最新待发条目，避免大缓冲队列；失败不自动重试。
+- Windows → 设备：设置中可选择“本机复制后自动发送”的目标，默认关闭。连续复制时保留最新待发条目，避免大缓冲队列；建立连接失败最多尝试三次，间隔 350 / 1000 毫秒；内容开始发送后不自动重发。没有持久离线发送队列，未确认保存的内容需手动检查后再发送。
 - 双方可独立开启“收到后复制”。已接收内容不会再次自动发送，避免回传循环。
 - **Android 10+ 普通应用在后台无法持续读取其他应用的剪贴板**，所以不是完全后台自动双向同步。此版本不使用无障碍、ADB 提权、Root 或自定义输入法绕过限制。系统或厂商省电策略、强制停止、Doze、VPN 断开仍可能中断连接，必要时按设备设置允许后台运行。系统拒绝复制超长内容时，可从历史重新复制或使用设备发送。
 
@@ -59,7 +61,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ./gradlew :app:testDebugUnitTest :app:connectedDebugAndroidTest :app:lintDebug
 ```
 
-设备测试会清空测试安装的数据，只应在专用模拟器运行。测试覆盖独立 Rust/Java 加密向量、Tailnet 地址边界、帧长度/类型篡改、旧数据库迁移、图片存储、接收确认和发现 nonce。
+设备测试会清空测试安装的数据，只应在专用模拟器运行。测试覆盖独立 Rust/Java 加密向量、MagicDNS 语法和解析地址过滤、探测请求/响应隔离、连接重试与 ACK 丢失不重发、Tailnet 地址边界、帧长度/类型篡改、旧数据库迁移、图片存储、无副作用连接探测、接收确认和发现 nonce。
 
 端到端测试需要安装 debug APK、启动 API 35 专用模拟器，并安装 Python `cryptography`。测试脚本会重置 debug 安装，不能用于真实历史数据：
 
@@ -67,4 +69,4 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 python checks/e2e.py --reset-test-installation
 ```
 
-`ADB` 可指定 adb 路径，`CLIPKEEP_TEST_DEVICE` 可指定 emulator 序号。脚本使用宿主机 TCP/UDP 45788 模拟对端，验证扫描→双向配对→退后台收文本/图→图片 URI 复制→反向加密发图→停止接收。真实 Tailscale VPN、厂商后台策略和 Android 9 真机仍需要实际设备验证。
+`ADB` 可指定 adb 路径，`CLIPKEEP_TEST_DEVICE` 可指定 emulator 序号。脚本使用宿主机 TCP/UDP 45788 模拟对端，验证扫描→双向配对→退后台收文本/图→图片 URI 复制→反向加密发图→加密连接测试→锁屏接收→Wi-Fi/移动网络切换→进程被系统杀死后的服务重建→主动停止与重开应用不恢复。真实 Tailscale VPN、厂商后台策略和 Android 9 真机仍需要实际设备验证。

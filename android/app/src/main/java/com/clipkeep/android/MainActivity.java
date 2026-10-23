@@ -122,6 +122,7 @@ public final class MainActivity extends Activity {
         super.onStart(); started = true;
         app.updates = error -> { if (error != null) toast(error); refreshStatus(); reload(); };
         getSystemService(ClipboardManager.class).addPrimaryClipChangedListener(clipboardListener);
+        if (ReceiveService.enabled(this) && !ReceiveService.running) startReceiver();
         refreshStatus(); reload();
     }
     @Override public void onWindowFocusChanged(boolean focused) {
@@ -300,18 +301,21 @@ public final class MainActivity extends Activity {
     private JSONArray peers() { return LanSettings.peers(this); }
     private byte[] receiveKey() { return LanSettings.key(this); }
     private void refreshStatus() {
-        if (status != null) status.setText(ReceiveService.running ? "后台接收已开启 · 文本 / 图片 · Wi-Fi / Tailnet" : "点击条目复制 · 长按预览、分享或发送");
+        if (status != null) status.setText(ReceiveService.enabled(this) ? ReceiveService.state : "点击条目复制 · 长按预览、分享或发送");
     }
-    private void stopReceiver() { stopService(new Intent(this, ReceiveService.class)); refreshStatus(); }
+    private void stopReceiver() {
+        ReceiveService.setEnabled(this, false);
+        stopService(new Intent(this, ReceiveService.class)); refreshStatus();
+    }
     private void startReceiver() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 43);
         startForegroundService(new Intent(this, ReceiveService.class));
         handler.postDelayed(this::refreshStatus, 300);
     }
-    private void toggleReceive() { if (ReceiveService.running) stopReceiver(); else startReceiver(); }
+    private void toggleReceive() { if (ReceiveService.enabled(this)) stopReceiver(); else startReceiver(); }
     private void lanDialog() {
-        String[] actions = {ReceiveService.running ? "关闭后台接收" : "开启后台接收", "扫描响应设备", "复制本机配对码", "手动添加设备", "管理已配对设备", "复制与同步设置", "重置本机配对码"};
+        String[] actions = {ReceiveService.enabled(this) ? "关闭后台接收" : "开启后台接收", "扫描响应设备", "复制本机配对码", "手动添加设备", "管理已配对设备", "复制与同步设置", "重置本机配对码", "后台运行与省电设置"};
         show(new AlertDialog.Builder(this).setTitle("Wi-Fi / Tailnet 设备").setItems(actions, (d, index) -> {
             if (index == 0) toggleReceive();
             if (index == 1) scanDialog();
@@ -319,11 +323,22 @@ public final class MainActivity extends Activity {
             if (index == 3) addPeer();
             if (index == 4) managePeers();
             if (index == 5) syncSettings();
+            if (index == 7) batterySettings();
             if (index == 6) show(new AlertDialog.Builder(this).setTitle("重置配对码？").setMessage("旧码将失效，后台接收会停止，其他设备需要重新配对。")
                 .setNegativeButton("取消", null).setPositiveButton("重置", (a,b) -> {
                     stopReceiver(); preferences().edit().remove("key").apply(); receiveKey(); toast("已重置");
                 }).create());
         }).setNegativeButton("关闭", null).create());
+    }
+    private void batterySettings() {
+        boolean exempt = getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
+        show(new AlertDialog.Builder(this).setTitle("后台运行与省电")
+            .setMessage((exempt ? "系统电池优化已豁免。" : "系统仍可能在省电或锁屏时限制网络。")
+                + "接收服务会在系统允许时恢复，网络恢复后继续接收。可在系统设置中允许后台运行；厂商的自启动设置需单独调整。强制停止后请重新打开应用。安卓后台无法持续读取其他应用剪贴板。")
+            .setPositiveButton("电池优化设置", (d,w) -> {
+                try { startActivity(new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); }
+                catch (ActivityNotFoundException error) { startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:" + getPackageName()))); }
+            }).setNegativeButton("关闭", null).create());
     }
     private void syncSettings() {
         String[] labels = {"收到后复制到系统剪贴板", "前台记录剪贴板，可发送到所选设备"};
@@ -340,14 +355,14 @@ public final class MainActivity extends Activity {
             }).setPositiveButton("完成", (d,w) -> toast("安卓只能在前台读取剪贴板；后台可接收，通知保持静音。接收内容不会再次自动发送。")).create());
     }
     private void scanDialog() {
-        EditText targets = new EditText(this); targets.setHint("可选：Tailscale IPv4，多台用空格分隔");
+        EditText targets = new EditText(this); targets.setHint("可选：Tailscale IPv4 / MagicDNS，多台用空格分隔");
         targets.setText(preferences().getString("scan_hosts", "")); targets.setMaxLines(4);
         targets.setFilters(new InputFilter[]{new InputFilter.LengthFilter(512)});
         show(new AlertDialog.Builder(this).setTitle("扫描响应设备")
-            .setMessage("同 Wi-Fi 自动广播发现；Tailnet 请输入设备的 100.x IPv4 地址。对方需升级 clipkeep 并开启接收，防火墙允许 UDP/TCP 45788。")
+            .setMessage("同 Wi-Fi 自动广播发现；Tailnet 请输入 100.x IPv4 或 MagicDNS 名称。对方需升级 clipkeep 并开启接收，防火墙允许 UDP/TCP 45788。")
             .setView(targets).setNegativeButton("取消", null).setPositiveButton("扫描", (d,w) -> {
                 String hosts = targets.getText().toString(); preferences().edit().putString("scan_hosts", hosts).apply();
-                status.setText("正在扫描，约 3 秒…");
+                status.setText("正在解析名称并扫描…");
                 task(() -> Discovery.scan(hosts), devices -> {
                     refreshStatus();
                     if (devices.isEmpty()) { toast("未发现响应设备，请检查接收开关、网络和防火墙"); return; }
@@ -384,7 +399,7 @@ public final class MainActivity extends Activity {
     private void addPeer(Discovery.Device device) {
         LinearLayout fields = column(); fields.setPadding(dp(20), 0, dp(20), 0);
         EditText name = new EditText(this); name.setHint("设备名称"); name.setSingleLine(true); name.setFilters(new InputFilter[]{new InputFilter.LengthFilter(40)});
-        EditText code = new EditText(this); code.setHint("粘贴 cklan1:// 配对码"); code.setSingleLine(true); code.setFilters(new InputFilter[]{new InputFilter.LengthFilter(128)});
+        EditText code = new EditText(this); code.setHint("粘贴 cklan1:// 配对码"); code.setSingleLine(true); code.setFilters(new InputFilter[]{new InputFilter.LengthFilter(320)});
         if (device != null) name.setText(device.name);
         fields.addView(name); fields.addView(code);
         CheckBox mutual = new CheckBox(this); mutual.setText("建立双向配对（对方需新版）"); mutual.setChecked(true); fields.addView(mutual);
@@ -395,10 +410,10 @@ public final class MainActivity extends Activity {
             try {
                 String label = name.getText().toString().trim(); if (label.isEmpty()) throw new IOException("请输入设备名称");
                 LanProtocol.Peer peer = LanProtocol.parseCode(code.getText().toString());
-                if (device != null && !peer.socketAddress().getAddress().getHostAddress().equals(device.address)) throw new IOException("配对码地址与所选设备不一致");
                 boolean both = mutual.isChecked();
                 if (both) startReceiver();
                 task(() -> {
+                    if (device != null && !peer.socketAddress().getAddress().getHostAddress().equals(device.address)) throw new IOException("配对码地址与所选设备不一致");
                     if (both) {
                         String body = new JSONObject().put("name", Build.MODEL.substring(0, Math.min(40, Build.MODEL.length())))
                             .put("key", Base64.getUrlEncoder().withoutPadding().encodeToString(receiveKey())).toString();
@@ -417,10 +432,21 @@ public final class MainActivity extends Activity {
     private void managePeers() {
         JSONArray saved = peers();
         if (saved.length() == 0) { toast("还没有配对设备"); return; }
-        show(new AlertDialog.Builder(this).setTitle("选择要移除的设备").setItems(peerNames(saved), (d, index) -> {
-            task(() -> { LanSettings.remove(this, LanProtocol.parseCode(saved.getJSONObject(index).getString("code")).address); return true; }, done -> toast("设备已移除"));
+        show(new AlertDialog.Builder(this).setTitle("管理已配对设备").setItems(peerNames(saved), (d, index) -> {
+            show(new AlertDialog.Builder(this).setTitle(saved.optJSONObject(index).optString("name"))
+                .setItems(new String[]{"测试连接", "移除设备"}, (a, action) -> task(() -> {
+                    LanProtocol.Peer peer = LanProtocol.parseCode(saved.getJSONObject(index).getString("code"));
+                    if (action == 0) {
+                        long start = System.nanoTime();
+                        try { Transfer.probe(peer); }
+                        catch (Exception error) { throw new IOException("连接测试失败：检查接收开关、配对码和网络；对方需 0.3.1 或更新版本。" + error.getMessage(), error); }
+                        return "加密连接正常 · " + ((System.nanoTime() - start) / 1_000_000) + " ms · 未写入历史";
+                    }
+                    LanSettings.remove(this, peer.address); return "设备已移除";
+                }, this::toast)).setNegativeButton("取消", null).create());
         }).create());
     }
+
     private void sendDialog(long id) {
         JSONArray saved = peers();
         if (saved.length() == 0) { addPeer(); return; }
