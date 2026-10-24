@@ -866,8 +866,9 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
             count += 1;
         }
         debug_assert_eq!(count, staged.count);
+        let mut files = db::deduplicate(&tx).map_err(to_err)?;
         tx.commit().map_err(to_err)?;
-        let files = db::enforce_storage(&conn, core.max_bytes()).map_err(to_err)?;
+        files.extend(db::enforce_storage(&conn, core.max_bytes()).map_err(to_err)?);
         drop(conn);
         core.drop_files(&files);
         count

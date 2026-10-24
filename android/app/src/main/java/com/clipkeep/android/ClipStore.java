@@ -22,12 +22,21 @@ final class ClipStore extends SQLiteOpenHelper {
         }
     }
     private final File images;
-    ClipStore(Context context) { super(context, "history.db", null, 2); images = new File(context.getFilesDir(), "images"); setWriteAheadLoggingEnabled(true); }
+    ClipStore(Context context) { super(context, "history.db", null, 3); images = new File(context.getFilesDir(), "images"); setWriteAheadLoggingEnabled(true); }
     @Override public void onConfigure(SQLiteDatabase db) {
         db.execSQL("PRAGMA cache_size=-2048");
         db.execSQL("PRAGMA temp_store=FILE");
         // Android's connection pool owns WAL and statement-cache configuration.
         db.setMaxSqlCacheSize(8);
+    }
+    @Override public void onOpen(SQLiteDatabase db) {
+        super.onOpen(db);
+        // onOpen can run before onUpgrade on a legacy database; wait until kind exists.
+        try (Cursor columns = db.rawQuery("PRAGMA table_info(clips)", null)) {
+            boolean hasKind = false;
+            while (columns.moveToNext()) if ("kind".equals(columns.getString(1))) { hasKind = true; break; }
+            if (hasKind) deduplicate(db);
+        }
     }
     @Override public void onCreate(SQLiteDatabase db) {
         db.execSQL("CREATE TABLE clips (_id INTEGER PRIMARY KEY, content TEXT NOT NULL, preview TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, bytes INTEGER NOT NULL, favorite INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL, kind INTEGER NOT NULL DEFAULT 0)");
@@ -35,8 +44,9 @@ final class ClipStore extends SQLiteOpenHelper {
         db.execSQL("CREATE INDEX clips_loose ON clips(updated, _id) WHERE favorite=0 AND pinned=0");
     }
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if (oldVersion == 1 && newVersion == 2) db.execSQL("ALTER TABLE clips ADD COLUMN kind INTEGER NOT NULL DEFAULT 0");
-        else throw new IllegalStateException("不支持的数据库版本");
+        if (oldVersion == 1 && newVersion >= 2) db.execSQL("ALTER TABLE clips ADD COLUMN kind INTEGER NOT NULL DEFAULT 0");
+        if (oldVersion <= 2 && newVersion >= 3) deduplicate(db);
+        if (oldVersion > 2 || newVersion != 3) throw new IllegalStateException("不支持的数据库版本");
     }
     synchronized long save(String text) throws IOException, GeneralSecurityException {
         if (text == null || text.trim().isEmpty()) throw new IOException("没有可保存的文本");
@@ -56,6 +66,7 @@ final class ClipStore extends SQLiteOpenHelper {
                 ContentValues stamp = new ContentValues(); stamp.put("updated", System.currentTimeMillis());
                 db.update("clips", stamp, "hash=?", new String[]{hash});
             }
+            deduplicate(db);
             trim(db);
             db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
@@ -167,6 +178,7 @@ final class ClipStore extends SQLiteOpenHelper {
                 ContentValues stamp = new ContentValues(); stamp.put("updated", System.currentTimeMillis());
                 db.update("clips", stamp, "hash=?", new String[]{hash});
             }
+            deduplicate(db);
             trim(db); db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
         collectImages(); return idForHash(hash);
@@ -182,6 +194,26 @@ final class ClipStore extends SQLiteOpenHelper {
                 }
             }
         } catch (IOException ignored) { /* Retry during the next storage operation. */ }
+    }
+
+    /** Removes legacy/imported rows with equal kind and content, even if their hashes differ. */
+    private void deduplicate(SQLiteDatabase db) {
+        try (Cursor groups = db.rawQuery("SELECT kind,content FROM clips GROUP BY kind,content HAVING COUNT(*) > 1", null)) {
+            while (groups.moveToNext()) {
+                int kind = groups.getInt(0); String content = groups.getString(1);
+                ArrayList<long[]> rows = new ArrayList<>();
+                try (Cursor cursor = db.rawQuery("SELECT _id,favorite,pinned,updated FROM clips WHERE kind=? AND content=? ORDER BY updated DESC,_id DESC",
+                        new String[]{Integer.toString(kind), content})) {
+                    while (cursor.moveToNext()) rows.add(new long[]{cursor.getLong(0), cursor.getInt(1), cursor.getInt(2), cursor.getLong(3)});
+                }
+                if (rows.size() < 2) continue;
+                long survivor = rows.get(0)[0], updated = rows.get(0)[3]; int favorite = 0, pinned = 0;
+                for (long[] row : rows) { favorite = Math.max(favorite, (int)row[1]); pinned = Math.max(pinned, (int)row[2]); updated = Math.max(updated, row[3]); }
+                ContentValues merged = new ContentValues(); merged.put("favorite", favorite); merged.put("pinned", pinned); merged.put("updated", updated);
+                db.update("clips", merged, "_id=?", new String[]{Long.toString(survivor)});
+                for (int i = 1; i < rows.size(); i++) db.delete("clips", "_id=?", new String[]{Long.toString(rows.get(i)[0])});
+            }
+        }
     }
 
     private static final class DatabaseUtilsCompat {

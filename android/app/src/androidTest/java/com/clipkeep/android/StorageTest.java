@@ -32,6 +32,18 @@ public class StorageTest {
         store.save("literal % _ \\"); assertEquals(1, store.list("% _ \\", false, 0).size());
         try { store.save("cklan1://secret"); fail("pairing code stored"); } catch (IOException expected) { }
     }
+    @Test public void testDuplicateRowsAreRemovedAndFlagsMerged() throws Exception {
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        android.content.ContentValues first = new android.content.ContentValues();
+        first.put("content", "legacy duplicate"); first.put("preview", "legacy duplicate"); first.put("hash", "legacy-a");
+        first.put("bytes", 16); first.put("favorite", 1); first.put("updated", 10); db.insertOrThrow("clips", null, first);
+        android.content.ContentValues second = new android.content.ContentValues();
+        second.put("content", "legacy duplicate"); second.put("preview", "legacy duplicate"); second.put("hash", "legacy-b");
+        second.put("bytes", 16); second.put("pinned", 1); second.put("updated", 20); db.insertOrThrow("clips", null, second);
+        store.save("legacy duplicate");
+        List<ClipStore.Row> rows = store.list("", false, 0);
+        assertEquals(1, rows.size()); assertTrue(rows.get(0).favorite); assertTrue(rows.get(0).pinned);
+    }
     private byte[] png() {
         android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888);
         bitmap.eraseColor(android.graphics.Color.RED);

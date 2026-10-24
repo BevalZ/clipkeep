@@ -14,6 +14,17 @@ const LIST_LIMIT: i64 = 1000;
 const KEEP_FOREVER: &str = "(favorite = 1 OR pinned = 1 OR group_id IS NOT NULL)";
 /// Pinned first, then newest first, in every view.
 const ORDER: &str = "ORDER BY pinned DESC, pinned_at DESC, updated_at DESC";
+type DuplicateRow = (
+    i64,
+    bool,
+    Option<i64>,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    i64,
+    i64,
+);
 
 pub const KIND_TEXT: &str = "text";
 pub const KIND_IMAGE: &str = "image";
@@ -117,6 +128,9 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         ));
     }
     migrate(&mut conn)?;
+    // Repair legacy/imported rows whose hashes disagree even though their content is equal.
+    // Image files are collected by the caller after the database is opened.
+    let _ = deduplicate(&conn)?;
     Ok(conn)
 }
 
@@ -248,7 +262,83 @@ pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Re
             now_ms()
         ],
     )?;
-    enforce_storage(conn, max_bytes)
+    let mut removed = deduplicate(conn)?;
+    removed.extend(enforce_storage(conn, max_bytes)?);
+    Ok(removed)
+}
+
+/// Removes duplicate rows with equal kind and stored content, even when legacy rows carry
+/// different hashes. The newest row survives; flags and timestamps from all rows are merged.
+/// Returns image file names belonging to deleted rows so the image store can garbage-collect them.
+pub fn deduplicate(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let groups: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT kind, content FROM clips GROUP BY kind, content HAVING COUNT(*) > 1",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut removed_files = Vec::new();
+    for (kind, content) in groups {
+        let rows: Vec<DuplicateRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, favorite, fav_at, pinned, pinned_at, group_id, created_at, updated_at, use_count
+                 FROM clips WHERE kind = ?1 AND content = ?2 ORDER BY updated_at DESC, id DESC",
+            )?;
+            stmt.query_map(params![kind, content], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let Some(survivor) = rows.first() else {
+            continue;
+        };
+        let favorite = rows.iter().any(|row| row.1);
+        let pinned = rows.iter().any(|row| row.3);
+        let fav_at = rows.iter().filter_map(|row| row.2).max();
+        let pinned_at = rows.iter().filter_map(|row| row.4).max();
+        let group_id = rows.iter().find_map(|row| row.5);
+        let created_at = rows.iter().map(|row| row.6).min().unwrap_or(survivor.6);
+        let updated_at = rows.iter().map(|row| row.7).max().unwrap_or(survivor.7);
+        let use_count = rows.iter().map(|row| row.8).sum::<i64>().max(1);
+        tx.execute(
+            "UPDATE clips SET favorite=?2, fav_at=?3, pinned=?4, pinned_at=?5, group_id=?6,
+             created_at=?7, updated_at=?8, use_count=?9 WHERE id=?1",
+            params![
+                survivor.0,
+                favorite as i64,
+                fav_at,
+                pinned as i64,
+                pinned_at,
+                group_id,
+                created_at,
+                updated_at,
+                use_count
+            ],
+        )?;
+        for duplicate in rows.iter().skip(1) {
+            if kind == KIND_IMAGE {
+                removed_files.push(content.clone());
+            }
+            tx.execute("DELETE FROM clips WHERE id = ?1", params![duplicate.0])?;
+        }
+    }
+    tx.commit()?;
+    Ok(removed_files)
 }
 
 pub fn enforce_storage(conn: &Connection, max_bytes: i64) -> rusqlite::Result<Vec<String>> {
@@ -401,11 +491,11 @@ pub fn edit_text(
     text: &str,
     max_bytes: i64,
 ) -> Result<Vec<String>, String> {
-    let row: Option<(String, bool, bool, bool)> = conn
+    let row: Option<(String, bool, bool, Option<i64>, i64, i64)> = conn
         .query_row(
-            "SELECT kind, favorite, pinned, group_id IS NOT NULL FROM clips WHERE id = ?1",
+            "SELECT kind, favorite, pinned, group_id, created_at, use_count FROM clips WHERE id = ?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
@@ -414,7 +504,8 @@ pub fn edit_text(
         Some(_) => return Err("只能编辑文本条目".into()),
         None => return Err("条目不存在".into()),
     }
-    let (_, favorite, pinned, grouped) = row.unwrap();
+    let (_, favorite, pinned, group_id, created_at, use_count) = row.unwrap();
+    let grouped = group_id.is_some();
     if max_bytes > 0 && text.len() as i64 > max_bytes && !favorite && !pinned && !grouped {
         return Err("文本超过普通历史容量上限，请先收藏或调高阈值".into());
     }
@@ -427,15 +518,36 @@ pub fn edit_text(
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if duplicate.is_some() {
-        return Err("相同文本已存在于历史记录".into());
+    if let Some(duplicate) = duplicate {
+        conn.execute(
+            "UPDATE clips SET favorite=MAX(favorite, ?2), pinned=MAX(pinned, ?3),
+             group_id=COALESCE(group_id, ?4), created_at=MIN(created_at, ?5),
+             updated_at=?6, use_count=use_count+?7 WHERE id=?1",
+            params![
+                duplicate,
+                favorite as i64,
+                pinned as i64,
+                group_id,
+                created_at,
+                now_ms(),
+                use_count
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM clips WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        let mut removed = deduplicate(conn).map_err(|e| e.to_string())?;
+        removed.extend(enforce_storage(conn, max_bytes).map_err(|e| e.to_string())?);
+        return Ok(removed);
     }
     conn.execute(
         "UPDATE clips SET content = ?2, preview = ?3, hash = ?4, size = ?5, updated_at = ?6 WHERE id = ?1",
         params![id, text, preview_of(KIND_TEXT, text), hash, text.len() as i64, now_ms()],
     )
     .map_err(|e| e.to_string())?;
-    enforce_storage(conn, max_bytes).map_err(|e| e.to_string())
+    let mut removed = deduplicate(conn).map_err(|e| e.to_string())?;
+    removed.extend(enforce_storage(conn, max_bytes).map_err(|e| e.to_string())?);
+    Ok(removed)
 }
 
 pub fn touch(conn: &Connection, id: i64) -> rusqlite::Result<()> {
@@ -759,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_text_preserves_identity_and_flags_and_rejects_duplicates() {
+    fn edit_text_preserves_identity_and_merges_duplicates() {
         let conn = mem();
         let id = add(&conn, "first", 5);
         let other = add(&conn, "already here", 12);
@@ -774,13 +886,9 @@ mod tests {
         assert!(row.favorite && row.pinned && row.truncated);
         assert_eq!(row.preview.chars().count(), PREVIEW_CHARS);
         assert_eq!(get(&conn, id).unwrap().unwrap().1, long);
-        assert!(
-            edit_text(&conn, id, "already here", 0)
-                .unwrap_err()
-                .contains("相同文本")
-        );
+        edit_text(&conn, id, "already here", 0).unwrap();
+        assert!(get(&conn, id).unwrap().is_none());
         assert_eq!(get(&conn, other).unwrap().unwrap().1, "already here");
-        assert_eq!(get(&conn, id).unwrap().unwrap().1, long);
     }
 
     #[test]
@@ -980,5 +1088,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!((count, fav), (1, 1));
+    }
+
+    #[test]
+    fn deduplicate_merges_legacy_rows_and_keeps_newest() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO clips (kind, content, preview, hash, favorite, fav_at, pinned, pinned_at,
+             group_id, created_at, updated_at, use_count, size)
+             VALUES ('text','same','same','legacy-a',1,10,0,NULL,NULL,1,10,2,4)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clips (kind, content, preview, hash, favorite, fav_at, pinned, pinned_at,
+             group_id, created_at, updated_at, use_count, size)
+             VALUES ('text','same','same','legacy-b',0,NULL,1,20,NULL,2,20,3,4)",
+            [],
+        )
+        .unwrap();
+        let removed = deduplicate(&conn).unwrap();
+        assert!(removed.is_empty());
+        let rows = list(&conn, Scope::All, "").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].favorite && rows[0].pinned);
+        assert_eq!(rows[0].updated_at, 20);
+        assert_eq!(rows[0].id, 2);
+        assert_eq!(rows[0].size, 4);
+        let uses: i64 = conn
+            .query_row("SELECT use_count FROM clips", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uses, 5);
     }
 }
