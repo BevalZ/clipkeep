@@ -74,5 +74,32 @@ public class LanProtocolTest {
         for (int i = 0; i < 20; i++) assertTrue(LanProtocol.allowed(LanProtocol.resolve("localhost")));
         assertEquals("100.64.0.1", LanProtocol.restrictedAddress(new java.net.InetAddress[]{java.net.InetAddress.getByName("8.8.8.8"), java.net.InetAddress.getByName("100.64.0.1")}).getHostAddress());
     }
+    @Test public void chunkedPayloadRoundTripsAndRejectsReorderedChunks() throws Exception {
+        byte[] key = key(), id = new byte[16]; Arrays.fill(id, (byte) 7);
+        byte[] payload = new byte[700000]; for (int i = 0; i < payload.length; i++) payload[i] = (byte)(i % 251);
+        int total = (payload.length + LanProtocol.CHUNK_BYTES - 1) / LanProtocol.CHUNK_BYTES;
+        ByteArrayOutputStream wire = new ByteArrayOutputStream();
+        for (int index = 0; index < total; index++) {
+            int start = index * LanProtocol.CHUNK_BYTES, end = Math.min(payload.length, start + LanProtocol.CHUNK_BYTES);
+            LanProtocol.writeChunk(wire, key, id, new byte[]{'C','K','I','1'}, index, total, payload.length, Arrays.copyOfRange(payload, start, end));
+        }
+        byte[] bytes = wire.toByteArray(); ByteArrayInputStream input = new ByteArrayInputStream(bytes);
+        LanProtocol.Message first = LanProtocol.readMessage(input, key); assertTrue(first.chunk());
+        assertArrayEquals(payload, LanProtocol.readChunked(input, key, first));
+        ByteArrayOutputStream reordered = new ByteArrayOutputStream();
+        int frameBytes = 20 + 16 + 37 + LanProtocol.CHUNK_BYTES;
+        reordered.write(bytes, 0, frameBytes); reordered.write(bytes, frameBytes * 2, bytes.length - frameBytes * 2); reordered.write(bytes, frameBytes, frameBytes);
+        ByteArrayInputStream bad = new ByteArrayInputStream(reordered.toByteArray());
+        LanProtocol.Message head = LanProtocol.readMessage(bad,key); assertThrows(IOException.class, () -> LanProtocol.readChunked(bad,key,head));
+    }
+    @Test public void independentChunkVectorAndStrictLimits() throws Exception {
+        byte[] wire = hex("434b4331000102030405060708090a0b0000003f88fb09022a13a046b08b36f99311036dc633f9ab6074adb9e6972fc574c0a63cec802cf3ecfb391ed2afe128fa0c0feb19ae6a7e8a1e38df924e47613c2804"); ByteArrayInputStream input = new ByteArrayInputStream(wire);
+        LanProtocol.Message first = LanProtocol.readMessage(input, key());
+        assertEquals("分块😀", LanProtocol.assemble(input, key(), first).text());
+        assertTrue(LanProtocol.readMessage(new ByteArrayInputStream(hex("434b4132000102030405060708090a0b0000002089fa0a032d12a347bf8a35f89410006ccd9be81707f637cabe7534eb03f678c4")), key()).chunkReceipt());
+        wire[25] ^= 1; assertThrows(Exception.class, () -> LanProtocol.readMessage(new ByteArrayInputStream(wire),key()));
+        assertThrows(IOException.class, () -> LanProtocol.writeChunk(new ByteArrayOutputStream(),key(),new byte[16],new byte[]{'C','K','L','1'},0,1,LanProtocol.MAX_TEXT_BYTES+1,new byte[]{1}));
+        assertThrows(IOException.class, () -> LanProtocol.writeChunk(new ByteArrayOutputStream(),key(),new byte[16],new byte[]{'C','K','L','1'},0,4294967295L,1,new byte[]{1}));
+    }
 
 }

@@ -16,6 +16,8 @@ public final class LanProtocol {
     public static final int MAX_TEXT_BYTES = 2 * 1024 * 1024;
     public static final int MAX_IMAGE_BYTES = 8 * 1024 * 1024;
     public static final long MAX_IMAGE_PIXELS = 16_000_000;
+    public static final int CHUNK_BYTES = 256 * 1024;
+    private static final int CHUNK_META_BYTES = 1 + 16 + 4 + 4 + 4 + 8;
     // At most one platform DNS lookup can remain in flight after a timeout.
     private static final ThreadPoolExecutor DNS = new ThreadPoolExecutor(0, 1, 10, TimeUnit.SECONDS,
         new ArrayBlockingQueue<>(1), task -> { Thread t = new Thread(task, "clipkeep-dns"); t.setDaemon(true); return t; });
@@ -113,7 +115,9 @@ public final class LanProtocol {
     public static final class Message {
         public final int magic;
         public final byte[] bytes;
-        Message(int magic, byte[] bytes) { this.magic = magic; this.bytes = bytes; }
+        public final Chunk chunk;
+        Message(int magic, byte[] bytes) { this.magic = magic; this.bytes = bytes; this.chunk = null; }
+        Message(int magic, Chunk chunk) { this.magic = magic; this.bytes = null; this.chunk = chunk; }
         public String text() throws IOException {
             return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(bytes)).toString();
@@ -122,26 +126,50 @@ public final class LanProtocol {
         public boolean probeReply() { return magic == 0x434b5231; }
         public boolean probe() { return magic == 0x434b4831; }
         public boolean pair() { return magic == 0x434b5031; }
+        public boolean capabilityProbe() { return magic == 0x434b4832; }
+        public boolean capabilityReply() { return magic == 0x434b5232; }
+        public boolean chunkReceipt() { return magic == 0x434b4132; }
+        public boolean chunk() { return magic == 0x434b4331; }
+    }
+    public static final class Chunk {
+        public final byte[] id, kind, bytes;
+        public final long index, total, totalBytes;
+        Chunk(byte[] id, byte[] kind, long index, long total, long totalBytes, byte[] bytes) { this.id = id; this.kind = kind; this.index = index; this.total = total; this.totalBytes = totalBytes; this.bytes = bytes; }
     }
     private static int limit(int magic) throws IOException {
         if (magic == 0x434b4c31) return MAX_TEXT_BYTES;
         if (magic == 0x434b4931) return MAX_IMAGE_BYTES;
         if (magic == 0x434b5031) return 1024;
         if (magic == 0x434b4831 || magic == 0x434b5231) return 32;
+        if (magic == 0x434b4132) return 16;
+        if (magic == 0x434b4832) return 32;
+        if (magic == 0x434b5232) return 33;
+        if (magic == 0x434b4331) return CHUNK_META_BYTES + CHUNK_BYTES;
         throw new IOException("协议版本不匹配，请更新接收端");
     }
     private static byte[] aad(int magic) throws IOException {
         limit(magic);
         if (magic == 0x434b5231) return "clipkeep-lan-probe-reply-v1".getBytes(StandardCharsets.UTF_8);
         if (magic == 0x434b4831) return "clipkeep-lan-probe-v1".getBytes(StandardCharsets.UTF_8);
+        if (magic == 0x434b4132) return "clipkeep-lan-chunk-receipt-v1".getBytes(StandardCharsets.UTF_8);
+        if (magic == 0x434b5232) return "clipkeep-lan-capability-reply-v1".getBytes(StandardCharsets.UTF_8);
+        if (magic == 0x434b4832) return "clipkeep-lan-capability-v1".getBytes(StandardCharsets.UTF_8);
+        if (magic == 0x434b4331) return "clipkeep-lan-chunk-v1".getBytes(StandardCharsets.UTF_8);
         return magic == 0x434b4c31 ? AAD : (magic == 0x434b4931 ? "clipkeep-lan-image-v1" : "clipkeep-lan-pair-v1").getBytes(StandardCharsets.UTF_8);
     }
     public static void writePayload(OutputStream stream, byte[] key, int magic, byte[] plain) throws IOException, GeneralSecurityException {
-        if (((magic == 0x434b4831 || magic == 0x434b5231) && plain.length != 32) || plain.length == 0 || plain.length > limit(magic)) throw new IOException("内容长度超限");
+        if (((magic == 0x434b4831 || magic == 0x434b5231 || magic == 0x434b4832) && plain.length != 32) || (magic == 0x434b5232 && plain.length != 33) || (magic == 0x434b4132 && plain.length != 16) || plain.length == 0 || plain.length > limit(magic)) throw new IOException("内容长度超限");
         byte[] nonce = nonce();
         byte[] encrypted = cipher(Cipher.ENCRYPT_MODE, key, nonce, aad(magic)).doFinal(plain);
         DataOutputStream out = new DataOutputStream(stream);
         out.writeInt(magic); out.write(nonce); out.writeInt(encrypted.length); out.write(encrypted); out.flush();
+    }
+    public static void writeChunk(OutputStream stream, byte[] key, byte[] id, byte[] kind, long index, long total, long totalBytes, byte[] bytes) throws IOException, GeneralSecurityException {
+        if (id.length != 16) throw new IOException("分块 ID 无效");
+        validateChunk(kind, index, total, totalBytes, bytes.length);
+        ByteBuffer plain = ByteBuffer.allocate(CHUNK_META_BYTES + bytes.length).order(java.nio.ByteOrder.BIG_ENDIAN);
+        plain.put((byte)1).put(id).put(kind).putInt((int)index).putInt((int)total).putLong(totalBytes).put(bytes);
+        writePayload(stream, key, 0x434b4331, plain.array());
     }
     public static Message readMessage(InputStream stream, byte[] key) throws IOException, GeneralSecurityException {
         DataInputStream in = new DataInputStream(stream);
@@ -152,9 +180,49 @@ public final class LanProtocol {
         byte[] encrypted = new byte[length]; in.readFully(encrypted);
         byte[] plain = cipher(Cipher.DECRYPT_MODE, key, nonce, aad(magic)).doFinal(encrypted);
         Message message = new Message(magic, plain);
-        if ((message.probe() || message.probeReply()) && plain.length != 32) throw new IOException("探测长度无效");
-        if (!message.image() && !message.probe() && !message.probeReply() && message.text().trim().isEmpty()) throw new IOException("空文本");
+        if ((message.probe() || message.probeReply() || message.capabilityProbe()) && plain.length != 32) throw new IOException("探测长度无效");
+        if (message.capabilityReply() && plain.length != 33) throw new IOException("能力响应长度无效");
+        if (message.chunkReceipt() && plain.length != 16) throw new IOException("分块确认长度无效");
+        if (message.chunk()) {
+            if (plain.length < CHUNK_META_BYTES || plain[0] != 1) throw new IOException("分块头无效");
+            ByteBuffer metadata = ByteBuffer.wrap(plain).order(java.nio.ByteOrder.BIG_ENDIAN);
+            metadata.get(); byte[] id = new byte[16]; metadata.get(id); byte[] kind = new byte[4]; metadata.get(kind);
+            long index = Integer.toUnsignedLong(metadata.getInt()), total = Integer.toUnsignedLong(metadata.getInt()), totalBytes = metadata.getLong();
+            validateChunk(kind, index, total, totalBytes, plain.length - CHUNK_META_BYTES);
+            return new Message(magic, new Chunk(id, kind, index, total, totalBytes, Arrays.copyOfRange(plain, CHUNK_META_BYTES, plain.length)));
+        }
+        if (!message.image() && !message.probe() && !message.probeReply() && !message.capabilityProbe() && !message.capabilityReply() && !message.chunkReceipt() && message.text().trim().isEmpty()) throw new IOException("空文本");
         return message;
+    }
+    private static void validateChunk(byte[] kind, long index, long total, long totalBytes, int length) throws IOException {
+        int type = kind.length == 4 ? ByteBuffer.wrap(kind).getInt() : 0;
+        long limit = type == 0x434b4c31 ? MAX_TEXT_BYTES : MAX_IMAGE_BYTES;
+        if ((type != 0x434b4c31 && type != 0x434b4931) || totalBytes <= 0 || totalBytes > limit || index < 0 || index >= total || total != (totalBytes + CHUNK_BYTES - 1) / CHUNK_BYTES) throw new IOException("分块范围无效");
+        if (length != Math.min(CHUNK_BYTES, totalBytes - index * CHUNK_BYTES)) throw new IOException("分块长度无效");
+    }
+    public static Message assemble(InputStream stream, byte[] key, Message message) throws IOException, GeneralSecurityException {
+        if (!message.chunk()) return message;
+        byte[] bytes = readChunked(stream, key, message);
+        Message result = new Message(ByteBuffer.wrap(message.chunk.kind).getInt(), bytes);
+        if (!result.image() && result.text().trim().isEmpty()) throw new IOException("空文本");
+        return result;
+    }
+    public static byte[] readChunked(InputStream stream, byte[] key, Message first) throws IOException, GeneralSecurityException {
+        if (!first.chunk() || first.chunk == null) throw new IOException("需要分块");
+        Chunk head = first.chunk;
+        long limit = Arrays.equals(head.kind, new byte[]{'C','K','L','1'}) ? MAX_TEXT_BYTES : MAX_IMAGE_BYTES;
+        if (head.index != 0 || head.totalBytes > limit) throw new IOException("分块起始位置无效");
+        byte[] output = new byte[(int)head.totalBytes];
+        System.arraycopy(head.bytes, 0, output, 0, head.bytes.length); int position = head.bytes.length;
+        for (long expected = 1; expected < head.total; expected++) {
+            Message next = readMessage(stream, key); if (!next.chunk() || next.chunk == null) throw new IOException("分块序列中断");
+            Chunk chunk = next.chunk;
+            if (!Arrays.equals(head.id, chunk.id) || !Arrays.equals(head.kind, chunk.kind) || chunk.index != expected || chunk.total != head.total || chunk.totalBytes != head.totalBytes) throw new IOException("分块序列无效");
+            if (position + chunk.bytes.length > output.length) throw new IOException("分块总长度超限");
+            System.arraycopy(chunk.bytes, 0, output, position, chunk.bytes.length); position += chunk.bytes.length;
+        }
+        if (position != head.totalBytes) throw new IOException("分块总长度不匹配");
+        return output;
     }
     public static String readText(InputStream stream, byte[] key) throws IOException, GeneralSecurityException {
         Message message = readMessage(stream, key);

@@ -33,6 +33,7 @@ public final class MainActivity extends Activity {
     private String lastClipboard = "";
     private final ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::captureAutomatic;
     private AlertDialog dialog;
+    private Transfer.Control sending;
     private final Runnable searchLater = () -> { offset = 0; reload(); };
 
 
@@ -134,6 +135,7 @@ public final class MainActivity extends Activity {
         app.updates = null;
         getSystemService(ClipboardManager.class).removePrimaryClipChangedListener(clipboardListener);
         if (loadTask != null) { loadTask.cancel(false); app.worker.purge(); }
+        if (sending != null) sending.cancel();
         if (dialog != null) { dialog.dismiss(); dialog = null; }
         rows.clear(); adapter.notifyDataSetChanged();
         super.onStop();
@@ -450,11 +452,27 @@ public final class MainActivity extends Activity {
     private void sendDialog(long id) {
         JSONArray saved = peers();
         if (saved.length() == 0) { addPeer(); return; }
-        show(new AlertDialog.Builder(this).setTitle("发送到设备").setItems(peerNames(saved), (d, index) -> task(() -> {
-            LanProtocol.Peer peer = LanProtocol.parseCode(saved.getJSONObject(index).getString("code"));
-            Transfer.clip(app.store, id, peer);
-            return "已发送，对方已确认保存";
-        }, this::toast)).create());
+        show(new AlertDialog.Builder(this).setTitle("发送到设备").setItems(peerNames(saved), (d, index) -> {
+            if (busy) { toast("正在处理，请稍候"); return; }
+            busy = true; Transfer.Control control = new Transfer.Control(); sending = control;
+            AlertDialog progress = new AlertDialog.Builder(this).setTitle("正在发送到 " + saved.optJSONObject(index).optString("name"))
+                .setMessage("正在连接并上传，等待对方确认保存。离开应用会取消本次手动发送。")
+                .setNegativeButton("取消发送", (a,w) -> control.cancel()).create();
+            progress.setCanceledOnTouchOutside(false);
+            progress.setOnCancelListener(a -> control.cancel());
+            handler.post(() -> { if (started && sending == control) show(progress); });
+            try {
+                app.worker.execute(() -> {
+                    String message;
+                    try {
+                        LanProtocol.Peer peer = LanProtocol.parseCode(saved.getJSONObject(index).getString("code"));
+                        Transfer.clip(app.store, id, peer, control); message = "已发送，对方已确认保存";
+                    } catch (Exception error) { message = error.getMessage(); }
+                    String result = message;
+                    handler.post(() -> { busy = false; if (sending == control) sending = null; progress.dismiss(); if (started && !isDestroyed()) { toast(result); refreshStatus(); } });
+                });
+            } catch (RejectedExecutionException error) { busy = false; sending = null; progress.dismiss(); toast("正在处理，请稍后重试"); }
+        }).create());
     }
     private void show(AlertDialog nextDialog) {
         if (dialog != null) dialog.dismiss(); dialog = nextDialog;

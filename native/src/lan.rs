@@ -4,7 +4,8 @@
 #[cfg(test)]
 use crate::lan_wire::read_text_frame;
 use crate::lan_wire::{
-    self, Message, allowed_ip, encrypt_frame, encrypt_payload, make_ack, read_message, verify_ack,
+    self, CHUNK_BYTES, Message, allowed_ip, assemble, encrypt_chunk, encrypt_frame,
+    encrypt_payload, make_ack, read_message, verify_ack,
 };
 use crate::{Core, changed};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -399,11 +400,71 @@ impl LanService {
     }
 
     pub fn send_text(&self, address: &str, text: &str) -> Result<(), String> {
+        if text.trim().is_empty() || text.len() > lan_wire::MAX_TEXT_BYTES {
+            return Err("文本为空或超过 2 MiB".into());
+        }
+        if text.len() > CHUNK_BYTES {
+            return self.send_chunked(address, b"CKL1", text.as_bytes());
+        }
         self.send(address, |key| encrypt_frame(key, text))
     }
     pub fn send_image(&self, address: &str, png: &[u8]) -> Result<(), String> {
+        if png.is_empty() || png.len() > lan_wire::MAX_IMAGE_BYTES {
+            return Err("图片为空或超过 8 MiB".into());
+        }
+        if png.len() > CHUNK_BYTES {
+            return self.send_chunked(address, b"CKI1", png);
+        }
         self.send(address, |key| encrypt_payload(key, b"CKI1", png))
     }
+    fn send_chunked(&self, address: &str, kind: &[u8; 4], bytes: &[u8]) -> Result<(), String> {
+        let peer = self
+            .config
+            .lock()
+            .map_err(|e| e.to_string())?
+            .peers
+            .iter()
+            .find(|p| p.address == address)
+            .cloned()
+            .ok_or("设备未配对")?;
+        let key = decode_key(&peer.key)?;
+        let (target, _) = parse_code(&format!("{CODE_PREFIX}{}/{}", peer.address, peer.key))?;
+        let target = crate::lan_address::resolve(&target)?;
+        if !probe_chunk_capability(target, &key).unwrap_or(false) {
+            return self.send(address, |key| {
+                if kind == b"CKI1" {
+                    encrypt_payload(key, kind, bytes)
+                } else {
+                    encrypt_frame(key, std::str::from_utf8(bytes).map_err(|_| "文本编码无效")?)
+                }
+            });
+        }
+        let mut stream = connect_retry(target)?;
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).map_err(|e| e.to_string())?;
+        let total = bytes.len().div_ceil(CHUNK_BYTES) as u32;
+        let mut io = DeadlineIo::new(&mut stream);
+        for index in 0..total {
+            let start = index as usize * CHUNK_BYTES;
+            let end = (start + CHUNK_BYTES).min(bytes.len());
+            let frame = encrypt_chunk(
+                &key,
+                &id,
+                kind,
+                index,
+                total,
+                bytes.len() as u64,
+                &bytes[start..end],
+            )?;
+            io.write_all(&frame)
+                .map_err(|e| format!("发送分块失败：{e}"))?;
+        }
+        match read_message(&mut io, &key)? {
+            Message::ChunkReceipt(receipt) if receipt == id => Ok(()),
+            _ => Err("分块确认与本次传输不匹配".into()),
+        }
+    }
+
     fn send(
         &self,
         address: &str,
@@ -435,6 +496,19 @@ fn connect_retry(target: SocketAddr) -> Result<TcpStream, String> {
         }
     }
     unreachable!()
+}
+
+fn probe_chunk_capability(target: SocketAddr, key: &[u8; 32]) -> Result<bool, String> {
+    let mut stream = connect_retry(target)?;
+    let mut challenge = [0u8; 32];
+    getrandom::fill(&mut challenge).map_err(|e| e.to_string())?;
+    let frame = encrypt_payload(key, b"CKH2", &challenge)?;
+    let mut io = DeadlineIo::new(&mut stream);
+    io.write_all(&frame).map_err(|e| e.to_string())?;
+    match read_message(&mut io, key)? {
+        Message::CapabilityReply(reply) => Ok(reply[..32] == challenge && reply[32] == 1),
+        _ => Ok(false),
+    }
 }
 
 fn discovery_loop(socket: UdpSocket, stop: Arc<AtomicBool>) {
@@ -555,7 +629,13 @@ fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Resul
         .lock()
         .map_err(|e| e.to_string())?
         .copy_received;
-    let message = read_message(&mut DeadlineIo::new(stream), key)?;
+    let mut io = DeadlineIo::new(stream);
+    let first = read_message(&mut io, key)?;
+    let transfer_id = match &first {
+        Message::Chunk { id, .. } => Some(*id),
+        _ => None,
+    };
+    let message = assemble(&mut io, key, first)?;
     match message {
         Message::Probe(challenge) => {
             return stream
@@ -563,6 +643,19 @@ fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Resul
                 .map_err(|e| e.to_string());
         }
         Message::ProbeReply(_) => return Err("非预期的探测响应".into()),
+        Message::CapabilityProbe(challenge) => {
+            let mut response = [0u8; 33];
+            response[..32].copy_from_slice(&challenge);
+            response[32] = 1;
+            stream
+                .write_all(&encrypt_payload(key, b"CKR2", &response)?)
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        Message::CapabilityReply(_) | Message::ChunkReceipt(_) => {
+            return Err("非预期的能力响应".into());
+        }
+        Message::Chunk { .. } => return Err("非预期的分块".into()),
         Message::Text(text) => {
             if text.contains(CODE_PREFIX) {
                 return Err("配对码不能进入历史".into());
@@ -608,7 +701,12 @@ fn receive_one(stream: &mut TcpStream, key: &[u8; 32], app: &AppHandle) -> Resul
         }
     }
     changed(app);
-    stream.write_all(&make_ack(key)?).map_err(|e| e.to_string())
+    let ack = if let Some(id) = transfer_id {
+        encrypt_payload(key, b"CKA2", &id)?
+    } else {
+        make_ack(key)?.to_vec()
+    };
+    stream.write_all(&ack).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -628,6 +726,67 @@ fn receive_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_negotiates_chunking_and_falls_back_for_old_receivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = LanService::new(dir.path());
+        let key = [9u8; 32];
+        let host = Ipv4Addr::new(127, 0, 0, 2);
+        service
+            .add_peer(
+                "test",
+                &format!("{CODE_PREFIX}{host}:{PORT}/{}", URL_SAFE_NO_PAD.encode(key)),
+            )
+            .unwrap();
+        let text = "中".repeat(100_000);
+        for modern in [true, false] {
+            let server = TcpListener::bind((host, PORT)).unwrap();
+            let expected = text.clone();
+            let worker = thread::spawn(move || {
+                let (mut probe, _) = server.accept().unwrap();
+                probe
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let Message::CapabilityProbe(challenge) = read_message(&mut probe, &key).unwrap()
+                else {
+                    panic!("expected capability probe");
+                };
+                if modern {
+                    let mut reply = [0u8; 33];
+                    reply[..32].copy_from_slice(&challenge);
+                    reply[32] = 1;
+                    probe
+                        .write_all(&encrypt_payload(&key, b"CKR2", &reply).unwrap())
+                        .unwrap();
+                }
+                drop(probe);
+                let (mut stream, _) = server.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let first = read_message(&mut stream, &key).unwrap();
+                let id = match &first {
+                    Message::Chunk { id, .. } => Some(*id),
+                    _ => None,
+                };
+                assert_eq!(id.is_some(), modern);
+                assert_eq!(
+                    assemble(&mut stream, &key, first).unwrap(),
+                    Message::Text(expected)
+                );
+                if let Some(id) = id {
+                    stream
+                        .write_all(&encrypt_payload(&key, b"CKA2", &id).unwrap())
+                        .unwrap();
+                } else {
+                    stream.write_all(&make_ack(&key).unwrap()).unwrap();
+                }
+            });
+            service.send_text(&format!("{host}:{PORT}"), &text).unwrap();
+            worker.join().unwrap();
+        }
+    }
 
     #[test]
     fn discovery_returns_only_public_metadata() {

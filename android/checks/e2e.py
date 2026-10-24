@@ -1,7 +1,7 @@
 import subprocess as sp,time,xml.etree.ElementTree as ET,re,socket,base64,os,threading,json,struct
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-import argparse,zlib
+import argparse,zlib,random
 parser=argparse.ArgumentParser(description="Destructive emulator-only E2E for a debug installation; requires Python cryptography.")
 parser.add_argument('--reset-test-installation', action='store_true', required=True)
 parser.parse_args()
@@ -9,6 +9,12 @@ adb=[os.environ.get('ADB', 'adb'),'-s',os.environ.get('CLIPKEEP_TEST_DEVICE','em
 assert adb[-1].startswith('emulator-'), 'Use a disposable emulator'
 chunk=lambda kind,data:struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
 test_png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(b'\x00\xff\x00\x00\xff'))+chunk(b'IEND',b'')
+# Deterministic incompressible image exercises multiple encrypted chunks.
+rng=random.Random(40)
+raw=b''.join(b'\x00'+rng.randbytes(256*4) for _ in range(384))
+large_png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',256,384,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b'')
+assert len(large_png)>262144
+modern=True
 def run(*args):return sp.check_output(adb+list(args),stderr=sp.DEVNULL)
 def nodes():
  run('shell','uiautomator','dump','/sdcard/clipkeep-ui.xml')
@@ -46,13 +52,28 @@ def receive():
   except OSError:return
   try:
    with s:
-    s.settimeout(10);h=exact(s,20);body=exact(s,int.from_bytes(h[16:20],'big'))
-    aad={b'CKP1':b'clipkeep-lan-pair-v1',b'CKI1':b'clipkeep-lan-image-v1',b'CKL1':b'clipkeep-lan-text-v1',b'CKH1':b'clipkeep-lan-probe-v1'}[h[:4]]
-    plain=cipher.decrypt(h[4:16],body,aad);received.append((h[:4],plain))
-    nonce=os.urandom(12)
-    if h[:4]==b'CKH1':
-     reply=cipher.encrypt(nonce,plain,b'clipkeep-lan-probe-reply-v1');s.sendall(b'CKR1'+nonce+len(reply).to_bytes(4,'big')+reply)
-    else:s.sendall(nonce+cipher.encrypt(nonce,b'OK',b'clipkeep-lan-ack-v1'))
+    s.settimeout(10)
+    def frame():
+     h=exact(s,20);body=exact(s,int.from_bytes(h[16:20],'big'))
+     aad={b'CKP1':b'clipkeep-lan-pair-v1',b'CKI1':b'clipkeep-lan-image-v1',b'CKL1':b'clipkeep-lan-text-v1',b'CKH1':b'clipkeep-lan-probe-v1',b'CKH2':b'clipkeep-lan-capability-v1',b'CKC1':b'clipkeep-lan-chunk-v1'}[h[:4]]
+     return h[:4],cipher.decrypt(h[4:16],body,aad)
+    magic,plain=frame();nonce=os.urandom(12)
+    if magic==b'CKH2':
+     if modern:
+      reply=cipher.encrypt(nonce,plain+b'\x01',b'clipkeep-lan-capability-reply-v1');s.sendall(b'CKR2'+nonce+len(reply).to_bytes(4,'big')+reply)
+     continue
+    if magic==b'CKC1':
+     version,tid,kind,index,total,size=struct.unpack('>B16s4sIIQ',plain[:37]);assert version==1 and index==0
+     output=bytearray(plain[37:])
+     for index in range(1,total):
+      nextmagic,p=frame();assert nextmagic==b'CKC1' and struct.unpack('>B16s4sIIQ',p[:37])==(1,tid,kind,index,total,size)
+      output.extend(p[37:])
+     assert len(output)==size;received.append((kind,bytes(output)))
+     reply=cipher.encrypt(nonce,tid,b'clipkeep-lan-chunk-receipt-v1');s.sendall(b'CKA2'+nonce+len(reply).to_bytes(4,'big')+reply)
+    elif magic==b'CKH1':
+     received.append((magic,plain));reply=cipher.encrypt(nonce,plain,b'clipkeep-lan-probe-reply-v1');s.sendall(b'CKR1'+nonce+len(reply).to_bytes(4,'big')+reply)
+    else:
+     received.append((magic,plain));s.sendall(nonce+cipher.encrypt(nonce,b'OK',b'clipkeep-lan-ack-v1'))
   except Exception as e:errors.append(str(e))
 threading.Thread(target=discover,daemon=True).start();threading.Thread(target=receive,daemon=True).start()
 try:
@@ -72,7 +93,15 @@ try:
   nonce=os.urandom(12);aad={b'CKI1':b'clipkeep-lan-image-v1',b'CKL1':b'clipkeep-lan-text-v1'}[magic];body=pcipher.encrypt(nonce,plain,aad)
   with socket.create_connection(('127.0.0.1',45789),timeout=5) as sock:
    sock.sendall(magic+nonce+len(body).to_bytes(4,'big')+body);ack=exact(sock,30);assert pcipher.decrypt(ack[:12],ack[12:],b'clipkeep-lan-ack-v1')==b'OK'
- send(b'CKL1','后台文本 中文 😀'.encode());png=test_png;send(b'CKI1',png)
+ def send_chunks(kind,plain):
+  tid=os.urandom(16);total=(len(plain)+262143)//262144
+  with socket.create_connection(('127.0.0.1',45789),timeout=5) as sock:
+   for index in range(total):
+    payload=struct.pack('>B16s4sIIQ',1,tid,kind,index,total,len(plain))+plain[index*262144:(index+1)*262144]
+    nonce=os.urandom(12);body=pcipher.encrypt(nonce,payload,b'clipkeep-lan-chunk-v1');sock.sendall(b'CKC1'+nonce+len(body).to_bytes(4,'big')+body)
+   h=exact(sock,20);assert h[:4]==b'CKA2';assert pcipher.decrypt(h[4:16],exact(sock,int.from_bytes(h[16:20],'big')),b'clipkeep-lan-chunk-receipt-v1')==tid
+ send_chunks(b'CKL1',('multi-chunk unicode 中😀 '*30000).encode())
+ send(b'CKL1','后台文本 中文 😀'.encode());png=large_png;send_chunks(b'CKI1',png)
  service=run('shell','dumpsys','activity','services','com.clipkeep.android').decode();assert 'isForeground=true' in service
  print('Background text + image receive and authenticated ACK passed',flush=True)
  # Keep the screen locked, then test a network transition and a system process kill.
@@ -104,7 +133,15 @@ try:
    x,y=point(n);run('shell','input','swipe',x,y,x,y,'800');break
  click('发送到设备');click('Desktop-test');time.sleep(2)
  assert any(m==b'CKI1' and p==png for m,p in received),[(m,len(p)) for m,p in received]
- print('Android image clipboard URI and reverse encrypted image transfer passed',flush=True)
+ print('Cross-language chunked text/image receive and reverse image transfer passed',flush=True)
+ modern=False
+ for n in nodes():
+  if n.get('text')=='[图片]':
+   x,y=point(n);run('shell','input','swipe',x,y,x,y,'800');break
+ count=sum(m==b'CKI1' and p==png for m,p in received)
+ click('发送到设备');click('Desktop-test');time.sleep(2)
+ assert sum(m==b'CKI1' and p==png for m,p in received)==count+1
+ print('Older receiver without capability response: legacy image fallback passed',flush=True)
  click('设备');click('关闭后台接收');time.sleep(1)
  try:send(b'CKL1',b'should fail');raise AssertionError('still receiving')
  except (ConnectionError,OSError,Exception) as e:

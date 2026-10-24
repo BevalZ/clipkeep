@@ -109,4 +109,50 @@ public class StorageTest {
         LanProtocol.writeText(frame, key, "Android 设备加密测试");
         assertEquals("Android 设备加密测试", LanProtocol.readText(new ByteArrayInputStream(frame.toByteArray()), key));
     }
+    @Test public void testCapabilityNegotiationAndChunkedTextTransfer() throws Exception {
+        byte[] key = LanProtocol.newKey();
+        LanProtocol.Peer peer = LanProtocol.parseCode("cklan1://127.0.0.1:45788/" + Base64.getUrlEncoder().withoutPadding().encodeToString(key));
+        byte[] text = new byte[700000]; for (int i = 0; i < text.length; i++) text[i] = (byte)('a' + (i % 23));
+        try (LanReceiver receiver = new LanReceiver(getContext(), key, store, new LanReceiver.Listener() { public void received(long id) { } public void failed(Exception error) { } })) {
+            assertTrue(Transfer.supportsChunked(peer));
+            Transfer.sendChunked(peer, new byte[]{'C','K','L','1'}, text);
+            assertEquals(new String(text, java.nio.charset.StandardCharsets.UTF_8), store.text(store.list("", false, 0).get(0).id));
+        }
+    }    @Test public void testPartialChunksAndMalformedUtf8NeverCommit() throws Exception {
+        byte[] key = LanProtocol.newKey(), id = new byte[16];
+        try (LanReceiver receiver = new LanReceiver(getContext(), key, store, new LanReceiver.Listener() { public void received(long saved) { } public void failed(Exception error) { } })) {
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", LanProtocol.PORT)) {
+                LanProtocol.writeChunk(socket.getOutputStream(), key, id, new byte[]{'C','K','L','1'}, 0, 2, LanProtocol.CHUNK_BYTES + 1, new byte[LanProtocol.CHUNK_BYTES]);
+                socket.shutdownOutput(); socket.setSoTimeout(3000);
+                assertEquals(-1, socket.getInputStream().read());
+            }
+            assertTrue(store.list("", false, 0).isEmpty());
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", LanProtocol.PORT)) {
+                LanProtocol.writeChunk(socket.getOutputStream(), key, id, new byte[]{'C','K','L','1'}, 0, 1, 1, new byte[]{(byte)0xff});
+                socket.setSoTimeout(3000); assertEquals(-1, socket.getInputStream().read());
+            }
+            assertTrue(store.list("", false, 0).isEmpty());
+        }
+    }
+    @Test public void testCancelClosesPendingAckWithoutRetry() throws Exception {
+        byte[] key = LanProtocol.newKey();
+        LanProtocol.Peer peer = LanProtocol.parseCode("cklan1://127.0.0.1:45788/" + Base64.getUrlEncoder().withoutPadding().encodeToString(key));
+        long clip = store.save("cancel pending ACK");
+        Transfer.Control control = new Transfer.Control();
+        java.util.concurrent.ExecutorService worker = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try (java.net.ServerSocket server = new java.net.ServerSocket(LanProtocol.PORT)) {
+            server.setSoTimeout(3000);
+            java.util.concurrent.Future<?> send = worker.submit(() -> {
+                try { Transfer.clip(store, clip, peer, control); fail("cancelled send succeeded"); }
+                catch (Exception error) { assertTrue(error.getMessage().contains("取消")); }
+            });
+            try (java.net.Socket socket = server.accept()) {
+                socket.setSoTimeout(3000); assertEquals("cancel pending ACK", LanProtocol.readText(socket.getInputStream(), key));
+                control.cancel(); send.get(3, java.util.concurrent.TimeUnit.SECONDS);
+                assertEquals(-1, socket.getInputStream().read());
+                server.setSoTimeout(500); assertThrows(java.net.SocketTimeoutException.class, server::accept);
+            }
+        } finally { worker.shutdownNow(); }
+    }
+
 }

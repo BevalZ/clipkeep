@@ -42,20 +42,27 @@ final class LanReceiver implements AutoCloseable {
                 socket.setSoTimeout(5000);
                 ScheduledFuture<?> deadline = deadlines.schedule(() -> { try { socket.close(); } catch (IOException ignored) { } }, 15, TimeUnit.SECONDS);
                 try {
-                    LanProtocol.Message message = LanProtocol.readMessage(socket.getInputStream(), key);
+                    LanProtocol.Message first = LanProtocol.readMessage(socket.getInputStream(), key);
+                    LanProtocol.Message message = LanProtocol.assemble(socket.getInputStream(), key, first);
                     if (closed) return;
                     if (message.probe()) {
                         LanProtocol.writePayload(socket.getOutputStream(), key, 0x434b5231, message.bytes);
                         continue;
                     }
-                    if (message.probeReply()) throw new IOException("非预期的探测响应");
+                    if (message.capabilityProbe()) {
+                        byte[] response = new byte[33]; System.arraycopy(message.bytes, 0, response, 0, 32); response[32] = 1;
+                        LanProtocol.writePayload(socket.getOutputStream(), key, 0x434b5232, response);
+                        continue;
+                    }
+                    if (message.probeReply() || message.capabilityReply() || message.chunkReceipt()) throw new IOException("非预期的探测响应");
                     long id = -1;
                     if (message.pair()) {
                         JSONObject pair = new JSONObject(message.text());
                         LanProtocol.Peer peer = LanProtocol.parseCode(LanProtocol.PREFIX + socket.getInetAddress().getHostAddress() + ":" + LanProtocol.PORT + "/" + pair.getString("key"));
                         LanSettings.add(context, pair.getString("name"), peer);
                     } else id = message.image() ? store.saveImage(message.bytes) : store.save(message.text());
-                    LanProtocol.writeAck(socket.getOutputStream(), key);
+                    if (first.chunk()) LanProtocol.writePayload(socket.getOutputStream(), key, 0x434b4132, first.chunk.id);
+                    else LanProtocol.writeAck(socket.getOutputStream(), key);
                     listener.received(id);
                 } finally { deadline.cancel(false); }
             } catch (Exception error) { if (!closed) listener.failed(error); }
