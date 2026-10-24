@@ -33,6 +33,7 @@ public final class MainActivity extends Activity {
     private String lastClipboard = "";
     private final ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::captureAutomatic;
     private AlertDialog dialog;
+    private final ImagePreviews previews = new ImagePreviews();
     private Transfer.Control sending;
     private final Runnable searchLater = () -> { offset = 0; reload(); };
 
@@ -105,7 +106,7 @@ public final class MainActivity extends Activity {
         pages.addView(previous); pages.addView(pageLabel, weight()); pages.addView(next); root.addView(pages);
         root.addView(button("清理普通历史", () -> show(new AlertDialog.Builder(this).setTitle("清理普通历史？")
             .setMessage("收藏和置顶会保留。普通历史默认最多占用 50 MB，超过后自动清理最早记录。")
-            .setNegativeButton("取消", null).setPositiveButton("清理", (d, w) -> task(() -> { app.store.clearHistory(); return "已清理"; }, message -> { toast(message); offset = 0; reload(); }))
+            .setNegativeButton("取消", null).setPositiveButton("清理", (d, w) -> task(() -> { app.store.clearHistory(); return "已清理"; }, message -> { previews.clear(); toast(message); offset = 0; reload(); }))
             .create())));
         setContentView(root);
         if (state != null) search.setText(state.getString("query", ""));
@@ -136,10 +137,16 @@ public final class MainActivity extends Activity {
         getSystemService(ClipboardManager.class).removePrimaryClipChangedListener(clipboardListener);
         if (loadTask != null) { loadTask.cancel(false); app.worker.purge(); }
         if (sending != null) sending.cancel();
+        previews.clear();
         if (dialog != null) { dialog.dismiss(); dialog = null; }
         rows.clear(); adapter.notifyDataSetChanged();
         super.onStop();
     }
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_RUNNING_LOW) previews.clear();
+    }
+    @Override public void onLowMemory() { super.onLowMemory(); previews.clear(); }
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putInt("offset", offset); state.putBoolean("favorites", onlyFavorites); state.putString("query", search.getText().toString());
         super.onSaveInstanceState(state);
@@ -263,10 +270,13 @@ public final class MainActivity extends Activity {
         });
     }
     private void previewImage(long id) {
-        task(() -> Images.preview(app.store.imageFile(id)), bitmap -> {
+        long generation = previews.generation();
+        task(() -> previews.load(app.store.imageFile(id), generation), bitmap -> {
+            if (!previews.isCurrent(generation)) return;
             if (bitmap == null) { toast("图片无法预览"); return; }
             ImageView preview = new ImageView(this); preview.setImageBitmap(bitmap); preview.setAdjustViewBounds(true);
-            show(new AlertDialog.Builder(this).setTitle("图片预览").setView(preview).setPositiveButton("关闭", null).create());
+            show(new AlertDialog.Builder(this).setTitle("图片预览").setView(preview).setPositiveButton("关闭", null).create(),
+                () -> preview.setImageDrawable(null));
         });
     }
     private void shareImage(long id) {
@@ -295,7 +305,7 @@ public final class MainActivity extends Activity {
                 startActivity(Intent.createChooser(new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "分享文本"));
             });
             else show(new AlertDialog.Builder(this).setTitle("删除这条记录？").setNegativeButton("取消", null)
-                .setPositiveButton("删除", (a, b) -> task(() -> { app.store.delete(clip.id); return true; }, done -> reload())).create());
+                .setPositiveButton("删除", (a, b) -> task(() -> { app.store.delete(clip.id); return true; }, done -> { previews.clear(); reload(); })).create());
         }).create());
     }
 
@@ -475,8 +485,11 @@ public final class MainActivity extends Activity {
         }).create());
     }
     private void show(AlertDialog nextDialog) {
+        show(nextDialog, () -> { });
+    }
+    private void show(AlertDialog nextDialog, Runnable dismissed) {
         if (dialog != null) dialog.dismiss(); dialog = nextDialog;
-        nextDialog.setOnDismissListener(d -> { if (dialog == nextDialog) dialog = null; }); nextDialog.show();
+        nextDialog.setOnDismissListener(d -> { dismissed.run(); if (dialog == nextDialog) dialog = null; }); nextDialog.show();
     }
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private LinearLayout column() { LinearLayout view = new LinearLayout(this); view.setOrientation(LinearLayout.VERTICAL); return view; }

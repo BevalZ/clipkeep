@@ -50,11 +50,15 @@ final class Images {
             return output.toByteArray();
         } finally { bitmap.recycle(); }
     }
-    static Bitmap preview(File file) {
+    static Bitmap preview(File file) throws IOException {
         BitmapFactory.Options bounds = new BitmapFactory.Options(); bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeFile(file.getPath(), bounds);
-        int sample = 1; while (Math.max(bounds.outWidth, bounds.outHeight) / sample > 1024) sample *= 2;
+        check(bounds);
+        int sample = 1; while (Math.max(bounds.outWidth, bounds.outHeight) > 1024L * sample) sample *= 2;
         bounds.inSampleSize = sample; bounds.inJustDecodeBounds = false;
-        return BitmapFactory.decodeFile(file.getPath(), bounds);
+        bounds.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        Bitmap bitmap = BitmapFactory.decodeFile(file.getPath(), bounds);
+        if (bitmap == null) throw new IOException("图片损坏，无法预览");
+        return bitmap;
     }
 }
