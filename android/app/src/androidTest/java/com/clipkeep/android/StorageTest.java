@@ -44,6 +44,66 @@ public class StorageTest {
         List<ClipStore.Row> rows = store.list("", false, 0);
         assertEquals(1, rows.size()); assertTrue(rows.get(0).favorite); assertTrue(rows.get(0).pinned);
     }
+    @Test public void testStartupRepairHandlesMaximumTextWithoutLargeCursorWindow() throws Exception {
+        // Full 2 MiB texts must remain inside SQLite during the duplicate scan.
+        String text = "x".repeat(LanProtocol.MAX_TEXT_BYTES);
+        long id = store.save(text);
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        db.execSQL("INSERT INTO clips(content,preview,hash,bytes,favorite,pinned,updated,kind) SELECT content,preview,'legacy-long',bytes,1,1,9999999999999,kind FROM clips WHERE _id=?", new Object[]{id});
+        long survivor = android.database.DatabaseUtils.longForQuery(db, "SELECT _id FROM clips WHERE hash='legacy-long'", null);
+        // Exercise the upgrade used by the previously signed 0.4.1 build.
+        db.setVersion(2); store.close(); store = new ClipStore(getContext());
+        List<ClipStore.Row> rows = store.list("", false, 0);
+        assertEquals(1, rows.size()); assertEquals(survivor, rows.get(0).id);
+        assertTrue(rows.get(0).favorite && rows.get(0).pinned);
+        assertEquals(text, store.text(survivor));
+        assertEquals(survivor, store.save(text)); assertEquals(survivor, store.save(text));
+        assertEquals(1, store.list("", false, 0).size());
+    }
+    @Test public void testSaveReturnsFutureDatedSurvivorAndRepairsCanonicalHash() throws Exception {
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        db.execSQL("INSERT INTO clips(content,preview,hash,bytes,favorite,pinned,updated,kind) VALUES('same','same','legacy-future',4,1,1,9999999999999,0)");
+        long id = android.database.DatabaseUtils.longForQuery(db, "SELECT _id FROM clips WHERE hash='legacy-future'", null);
+        assertEquals(id, store.save("same")); assertEquals(id, store.save("same"));
+        List<ClipStore.Row> rows = store.list("", false, 0);
+        assertEquals(1, rows.size()); assertTrue(rows.get(0).favorite && rows.get(0).pinned);
+    }
+    @Test public void testImageRepairKeepsSharedFileAndDoesNotMergeTextWithFilename() throws Exception {
+        byte[] original = png(); long id = store.saveImage(original); File file = store.imageFile(id);
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        db.execSQL("INSERT INTO clips(content,preview,hash,bytes,favorite,pinned,updated,kind) SELECT content,preview,'legacy-image',bytes,1,1,9999999999999,kind FROM clips WHERE _id=?", new Object[]{id});
+        store.save(file.getName());
+        long survivor = store.saveImage(original);
+        assertEquals(2, store.list("", false, 0).size());
+        assertArrayEquals(original, store.imageBytes(survivor)); assertTrue(file.exists());
+        store.close(); store = new ClipStore(getContext());
+        assertEquals(2, store.list("", false, 0).size());
+        store.collectImages(); assertTrue(file.exists());
+        store.delete(survivor); assertFalse(file.exists());
+    }
+    @Test public void testSaveMergeFailureRollsBackInsertionAndFlags() throws Exception {
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        db.execSQL("INSERT INTO clips(content,preview,hash,bytes,favorite,pinned,updated,kind) VALUES('same','same','legacy-failure',4,1,1,1,0)");
+        db.execSQL("CREATE TRIGGER fail_merge BEFORE DELETE ON clips BEGIN SELECT RAISE(ABORT,'simulated failure'); END");
+        assertThrows(android.database.sqlite.SQLiteException.class, () -> store.save("same"));
+        assertEquals(1, store.list("", false, 0).size());
+        assertEquals(1, android.database.DatabaseUtils.longForQuery(db, "SELECT COUNT(*) FROM clips WHERE hash='legacy-failure' AND updated=1 AND favorite=1 AND pinned=1", null));
+        db.execSQL("DROP TRIGGER fail_merge"); store.save("same");
+        assertEquals(1, store.list("", false, 0).size());
+    }
+    @Test public void testExactContentAndStartupBatches() throws Exception {
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        for (int i=0; i<70; i++) {
+            long id = store.save("item " + i);
+            db.execSQL("INSERT INTO clips(content,preview,hash,bytes,updated,kind) SELECT content,preview,?,bytes,1,kind FROM clips WHERE _id=?", new Object[]{"legacy-" + i, id});
+        }
+        String prefix = "x".repeat(400);
+        for (String text : new String[]{prefix + "a", prefix + "b", " A ", "a", "A"}) store.save(text);
+        store.close(); store = new ClipStore(getContext());
+        assertEquals(75, store.list("", false, 0).size());
+        store.close(); store = new ClipStore(getContext());
+        assertEquals(75, store.list("", false, 0).size());
+    }
     private byte[] png() {
         android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888);
         bitmap.eraseColor(android.graphics.Color.RED);

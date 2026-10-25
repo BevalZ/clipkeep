@@ -31,12 +31,7 @@ final class ClipStore extends SQLiteOpenHelper {
     }
     @Override public void onOpen(SQLiteDatabase db) {
         super.onOpen(db);
-        // onOpen can run before onUpgrade on a legacy database; wait until kind exists.
-        try (Cursor columns = db.rawQuery("PRAGMA table_info(clips)", null)) {
-            boolean hasKind = false;
-            while (columns.moveToNext()) if ("kind".equals(columns.getString(1))) { hasKind = true; break; }
-            if (hasKind) deduplicate(db);
-        }
+        deduplicate(db);
     }
     @Override public void onCreate(SQLiteDatabase db) {
         db.execSQL("CREATE TABLE clips (_id INTEGER PRIMARY KEY, content TEXT NOT NULL, preview TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, bytes INTEGER NOT NULL, favorite INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL, kind INTEGER NOT NULL DEFAULT 0)");
@@ -44,9 +39,9 @@ final class ClipStore extends SQLiteOpenHelper {
         db.execSQL("CREATE INDEX clips_loose ON clips(updated, _id) WHERE favorite=0 AND pinned=0");
     }
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if (oldVersion == 1 && newVersion >= 2) db.execSQL("ALTER TABLE clips ADD COLUMN kind INTEGER NOT NULL DEFAULT 0");
-        if (oldVersion <= 2 && newVersion >= 3) deduplicate(db);
-        if (oldVersion > 2 || newVersion != 3) throw new IllegalStateException("不支持的数据库版本");
+        if (oldVersion < 1 || oldVersion > 2 || newVersion != 3) throw new IllegalStateException("不支持的数据库版本");
+        if (oldVersion == 1) db.execSQL("ALTER TABLE clips ADD COLUMN kind INTEGER NOT NULL DEFAULT 0");
+        // onOpen repairs duplicate rows after all schema changes have committed.
     }
     synchronized long save(String text) throws IOException, GeneralSecurityException {
         if (text == null || text.trim().isEmpty()) throw new IOException("没有可保存的文本");
@@ -66,7 +61,9 @@ final class ClipStore extends SQLiteOpenHelper {
                 ContentValues stamp = new ContentValues(); stamp.put("updated", System.currentTimeMillis());
                 db.update("clips", stamp, "hash=?", new String[]{hash});
             }
-            deduplicate(db);
+            long survivor = mergeEqual(db, idForHash(hash));
+            ContentValues canonical = new ContentValues(); canonical.put("hash", hash);
+            db.update("clips", canonical, "_id=?", new String[]{Long.toString(survivor)});
             trim(db);
             db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
@@ -178,7 +175,9 @@ final class ClipStore extends SQLiteOpenHelper {
                 ContentValues stamp = new ContentValues(); stamp.put("updated", System.currentTimeMillis());
                 db.update("clips", stamp, "hash=?", new String[]{hash});
             }
-            deduplicate(db);
+            long survivor = mergeEqual(db, idForHash(hash));
+            ContentValues canonical = new ContentValues(); canonical.put("hash", hash);
+            db.update("clips", canonical, "_id=?", new String[]{Long.toString(survivor)});
             trim(db); db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
         collectImages(); return idForHash(hash);
@@ -196,24 +195,38 @@ final class ClipStore extends SQLiteOpenHelper {
         } catch (IOException ignored) { /* Retry during the next storage operation. */ }
     }
 
-    /** Removes legacy/imported rows with equal kind and content, even if their hashes differ. */
-    private void deduplicate(SQLiteDatabase db) {
-        try (Cursor groups = db.rawQuery("SELECT kind,content FROM clips GROUP BY kind,content HAVING COUNT(*) > 1", null)) {
-            while (groups.moveToNext()) {
-                int kind = groups.getInt(0); String content = groups.getString(1);
-                ArrayList<long[]> rows = new ArrayList<>();
-                try (Cursor cursor = db.rawQuery("SELECT _id,favorite,pinned,updated FROM clips WHERE kind=? AND content=? ORDER BY updated DESC,_id DESC",
-                        new String[]{Integer.toString(kind), content})) {
-                    while (cursor.moveToNext()) rows.add(new long[]{cursor.getLong(0), cursor.getInt(1), cursor.getInt(2), cursor.getLong(3)});
-                }
-                if (rows.size() < 2) continue;
-                long survivor = rows.get(0)[0], updated = rows.get(0)[3]; int favorite = 0, pinned = 0;
-                for (long[] row : rows) { favorite = Math.max(favorite, (int)row[1]); pinned = Math.max(pinned, (int)row[2]); updated = Math.max(updated, row[3]); }
-                ContentValues merged = new ContentValues(); merged.put("favorite", favorite); merged.put("pinned", pinned); merged.put("updated", updated);
-                db.update("clips", merged, "_id=?", new String[]{Long.toString(survivor)});
-                for (int i = 1; i < rows.size(); i++) db.delete("clips", "_id=?", new String[]{Long.toString(rows.get(i)[0])});
-            }
+    /** Compare content in SQLite; never materialize large duplicate texts in CursorWindow. */
+    private long mergeEqual(SQLiteDatabase db, long representative) {
+        String equal = "kind=(SELECT kind FROM clips WHERE _id=?) AND content=(SELECT content FROM clips WHERE _id=?)";
+        long survivor;
+        try (Cursor cursor = db.rawQuery("SELECT _id FROM clips WHERE " + equal + " ORDER BY updated DESC,_id DESC LIMIT 2",
+                new String[]{Long.toString(representative), Long.toString(representative)})) {
+            if (!cursor.moveToFirst()) throw new SQLiteException("未找到去重记录");
+            survivor = cursor.getLong(0);
+            if (!cursor.moveToNext()) return survivor;
         }
+        db.execSQL("UPDATE clips SET favorite=(SELECT MAX(favorite) FROM clips WHERE " + equal + "),"
+            + "pinned=(SELECT MAX(pinned) FROM clips WHERE " + equal + "),"
+            + "updated=(SELECT MAX(updated) FROM clips WHERE " + equal + ") WHERE _id=?",
+            new Object[]{representative, representative, representative, representative, representative, representative, survivor});
+        // Use the surviving row as the reference so it remains valid throughout deletion.
+        db.execSQL("DELETE FROM clips WHERE " + equal + " AND _id<>?", new Object[]{survivor, survivor, survivor});
+        return survivor;
+    }
+    /** Full repair runs on open only; each save checks just the matching incoming content. */
+    private void deduplicate(SQLiteDatabase db) {
+        db.beginTransaction();
+        try {
+            while (true) {
+                ArrayList<Long> ids = new ArrayList<>(64);
+                try (Cursor cursor = db.rawQuery("SELECT MIN(_id) FROM clips GROUP BY kind,content HAVING COUNT(*)>1 LIMIT 64", null)) {
+                    while (cursor.moveToNext()) ids.add(cursor.getLong(0));
+                }
+                if (ids.isEmpty()) break;
+                for (long id : ids) mergeEqual(db, id);
+            }
+            db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
     }
 
     private static final class DatabaseUtilsCompat {

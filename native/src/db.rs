@@ -14,17 +14,6 @@ const LIST_LIMIT: i64 = 1000;
 const KEEP_FOREVER: &str = "(favorite = 1 OR pinned = 1 OR group_id IS NOT NULL)";
 /// Pinned first, then newest first, in every view.
 const ORDER: &str = "ORDER BY pinned DESC, pinned_at DESC, updated_at DESC";
-type DuplicateRow = (
-    i64,
-    bool,
-    Option<i64>,
-    bool,
-    Option<i64>,
-    Option<i64>,
-    i64,
-    i64,
-    i64,
-);
 
 pub const KIND_TEXT: &str = "text";
 pub const KIND_IMAGE: &str = "image";
@@ -245,100 +234,109 @@ pub fn is_file_referenced(conn: &Connection, file: &str) -> rusqlite::Result<boo
 
 /// Inserts or bumps an item to the top, then trims loose history over the byte budget
 /// (0 = unlimited). Returns image file names of any rows removed.
-pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Result<Vec<String>> {
-    conn.execute(
-        "INSERT INTO clips (kind, content, preview, hash, width, height, size, source, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-         ON CONFLICT(hash) DO UPDATE SET updated_at = excluded.updated_at, use_count = use_count + 1",
-        params![
-            clip.kind,
-            clip.content,
-            preview_of(clip.kind, clip.content),
-            clip.hash,
-            clip.width,
-            clip.height,
-            clip.size,
-            clip.source,
-            now_ms()
-        ],
-    )?;
-    let mut removed = deduplicate(conn)?;
-    removed.extend(enforce_storage(conn, max_bytes)?);
-    Ok(removed)
-}
-
-/// Removes duplicate rows with equal kind and stored content, even when legacy rows carry
-/// different hashes. The newest row survives; flags and timestamps from all rows are merged.
-/// Returns image file names belonging to deleted rows so the image store can garbage-collect them.
-pub fn deduplicate(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let groups: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT kind, content FROM clips GROUP BY kind, content HAVING COUNT(*) > 1",
-        )?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?
-    };
-    if groups.is_empty() {
-        return Ok(Vec::new());
-    }
-    let tx = conn.unchecked_transaction()?;
-    let mut removed_files = Vec::new();
-    for (kind, content) in groups {
-        let rows: Vec<DuplicateRow> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, favorite, fav_at, pinned, pinned_at, group_id, created_at, updated_at, use_count
-                 FROM clips WHERE kind = ?1 AND content = ?2 ORDER BY updated_at DESC, id DESC",
-            )?;
-            stmt.query_map(params![kind, content], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, i64>(1)? != 0,
-                    row.get(2)?,
-                    row.get::<_, i64>(3)? != 0,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?
-        };
-        let Some(survivor) = rows.first() else {
-            continue;
-        };
-        let favorite = rows.iter().any(|row| row.1);
-        let pinned = rows.iter().any(|row| row.3);
-        let fav_at = rows.iter().filter_map(|row| row.2).max();
-        let pinned_at = rows.iter().filter_map(|row| row.4).max();
-        let group_id = rows.iter().find_map(|row| row.5);
-        let created_at = rows.iter().map(|row| row.6).min().unwrap_or(survivor.6);
-        let updated_at = rows.iter().map(|row| row.7).max().unwrap_or(survivor.7);
-        let use_count = rows.iter().map(|row| row.8).sum::<i64>().max(1);
-        tx.execute(
-            "UPDATE clips SET favorite=?2, fav_at=?3, pinned=?4, pinned_at=?5, group_id=?6,
-             created_at=?7, updated_at=?8, use_count=?9 WHERE id=?1",
-            params![
-                survivor.0,
-                favorite as i64,
-                fav_at,
-                pinned as i64,
-                pinned_at,
-                group_id,
-                created_at,
-                updated_at,
-                use_count
-            ],
-        )?;
-        for duplicate in rows.iter().skip(1) {
-            if kind == KIND_IMAGE {
-                removed_files.push(content.clone());
-            }
-            tx.execute("DELETE FROM clips WHERE id = ?1", params![duplicate.0])?;
+// Savepoints compose with backup imports and roll back the entire merge on failure.
+fn write_atomic<T>(
+    conn: &Connection,
+    work: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    conn.execute_batch("SAVEPOINT clipkeep_write")?;
+    match work() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE clipkeep_write")?;
+            Ok(value)
+        }
+        Err(error) => {
+            conn.execute_batch("ROLLBACK TO clipkeep_write; RELEASE clipkeep_write")?;
+            Err(error)
         }
     }
-    tx.commit()?;
-    Ok(removed_files)
+}
+
+pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Result<Vec<String>> {
+    write_atomic(conn, || {
+        conn.execute(
+            "INSERT INTO clips (kind, content, preview, hash, width, height, size, source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(hash) DO UPDATE SET updated_at = excluded.updated_at, use_count = use_count + 1",
+            params![clip.kind, clip.content, preview_of(clip.kind, clip.content), clip.hash,
+                clip.width, clip.height, clip.size, clip.source, now_ms()],
+        )?;
+        let id = conn.query_row("SELECT id FROM clips WHERE hash=?1", [clip.hash], |r| {
+            r.get(0)
+        })?;
+        let survivor = merge_equal(conn, id, false)?;
+        // A future-dated legacy row may survive. Retain the canonical incoming hash for sync.
+        conn.execute(
+            "UPDATE clips SET hash=?2 WHERE id=?1",
+            params![survivor, clip.hash],
+        )?;
+        enforce_storage(conn, max_bytes)
+    })
+}
+
+/// Compare full stored content inside SQLite, transferring only IDs/metadata to Rust.
+/// Equal image references share one file, which remains referenced by the survivor.
+fn merge_equal(
+    conn: &Connection,
+    representative: i64,
+    keep_identity: bool,
+) -> rusqlite::Result<i64> {
+    let equal = "kind=(SELECT kind FROM clips WHERE id=?1) AND content=(SELECT content FROM clips WHERE id=?1)";
+    let matches: Vec<i64> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM clips WHERE {equal} ORDER BY updated_at DESC,id DESC LIMIT 2"
+        ))?;
+        stmt.query_map([representative], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    if matches.len() < 2 {
+        return Ok(representative);
+    }
+    let survivor: i64 = if keep_identity {
+        representative
+    } else {
+        matches[0]
+    };
+    conn.execute(
+        &format!("UPDATE clips SET
+            favorite=(SELECT MAX(favorite) FROM clips WHERE {equal}),
+            fav_at=(SELECT MAX(fav_at) FROM clips WHERE {equal}),
+            pinned=(SELECT MAX(pinned) FROM clips WHERE {equal}),
+            pinned_at=(SELECT MAX(pinned_at) FROM clips WHERE {equal}),
+            group_id=(SELECT group_id FROM clips WHERE {equal} AND group_id IS NOT NULL ORDER BY updated_at DESC,id DESC LIMIT 1),
+            created_at=(SELECT MIN(created_at) FROM clips WHERE {equal}),
+            updated_at=(SELECT MAX(updated_at) FROM clips WHERE {equal}),
+            use_count=(SELECT SUM(use_count) FROM clips WHERE {equal})
+         WHERE id=?2"), params![representative, survivor],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM clips WHERE {equal} AND id<>?2"),
+        params![survivor, survivor],
+    )?;
+    Ok(survivor)
+}
+
+/// Startup/import repair, bounded to 64 representative IDs at a time. No text bodies or
+/// duplicate groups are collected into application memory. Ordinary saves only inspect their item.
+pub fn deduplicate(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    write_atomic(conn, || {
+        loop {
+            let ids: Vec<i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT MIN(id) FROM clips GROUP BY kind,content HAVING COUNT(*)>1 LIMIT 64",
+                )?;
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                merge_equal(conn, id, false)?;
+            }
+        }
+        Ok(Vec::new())
+    })
 }
 
 pub fn enforce_storage(conn: &Connection, max_bytes: i64) -> rusqlite::Result<Vec<String>> {
@@ -371,11 +369,12 @@ pub fn enforce_storage(conn: &Connection, max_bytes: i64) -> rusqlite::Result<Ve
             }
         }
     }
-    let tx = conn.unchecked_transaction()?;
-    for id in ids {
-        tx.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
-    }
-    tx.commit()?;
+    write_atomic(conn, || {
+        for id in ids {
+            conn.execute("DELETE FROM clips WHERE id=?1", [id])?;
+        }
+        Ok(())
+    })?;
     Ok(files)
 }
 
@@ -491,11 +490,11 @@ pub fn edit_text(
     text: &str,
     max_bytes: i64,
 ) -> Result<Vec<String>, String> {
-    let row: Option<(String, bool, bool, Option<i64>, i64, i64)> = conn
+    let row: Option<(String, bool, bool, bool)> = conn
         .query_row(
-            "SELECT kind, favorite, pinned, group_id, created_at, use_count FROM clips WHERE id = ?1",
+            "SELECT kind, favorite, pinned, group_id IS NOT NULL FROM clips WHERE id = ?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
@@ -504,50 +503,28 @@ pub fn edit_text(
         Some(_) => return Err("只能编辑文本条目".into()),
         None => return Err("条目不存在".into()),
     }
-    let (_, favorite, pinned, group_id, created_at, use_count) = row.unwrap();
-    let grouped = group_id.is_some();
+    let (_, favorite, pinned, grouped) = row.unwrap();
     if max_bytes > 0 && text.len() as i64 > max_bytes && !favorite && !pinned && !grouped {
         return Err("文本超过普通历史容量上限，请先收藏或调高阈值".into());
     }
     let hash = text_hash(text);
-    let duplicate: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM clips WHERE hash = ?1 AND id != ?2",
-            params![hash, id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if let Some(duplicate) = duplicate {
+    write_atomic(conn, || {
+        // Change content first while retaining the old unique hash until duplicate rows are gone.
         conn.execute(
-            "UPDATE clips SET favorite=MAX(favorite, ?2), pinned=MAX(pinned, ?3),
-             group_id=COALESCE(group_id, ?4), created_at=MIN(created_at, ?5),
-             updated_at=?6, use_count=use_count+?7 WHERE id=?1",
+            "UPDATE clips SET content=?2, preview=?3, size=?4, updated_at=?5 WHERE id=?1",
             params![
-                duplicate,
-                favorite as i64,
-                pinned as i64,
-                group_id,
-                created_at,
-                now_ms(),
-                use_count
+                id,
+                text,
+                preview_of(KIND_TEXT, text),
+                text.len() as i64,
+                now_ms()
             ],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM clips WHERE id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-        let mut removed = deduplicate(conn).map_err(|e| e.to_string())?;
-        removed.extend(enforce_storage(conn, max_bytes).map_err(|e| e.to_string())?);
-        return Ok(removed);
-    }
-    conn.execute(
-        "UPDATE clips SET content = ?2, preview = ?3, hash = ?4, size = ?5, updated_at = ?6 WHERE id = ?1",
-        params![id, text, preview_of(KIND_TEXT, text), hash, text.len() as i64, now_ms()],
-    )
-    .map_err(|e| e.to_string())?;
-    let mut removed = deduplicate(conn).map_err(|e| e.to_string())?;
-    removed.extend(enforce_storage(conn, max_bytes).map_err(|e| e.to_string())?);
-    Ok(removed)
+        )?;
+        merge_equal(conn, id, true)?;
+        conn.execute("UPDATE clips SET hash=?2 WHERE id=?1", params![id, hash])?;
+        enforce_storage(conn, max_bytes)
+    })
+    .map_err(|e| e.to_string())
 }
 
 pub fn touch(conn: &Connection, id: i64) -> rusqlite::Result<()> {
@@ -887,8 +864,8 @@ mod tests {
         assert_eq!(row.preview.chars().count(), PREVIEW_CHARS);
         assert_eq!(get(&conn, id).unwrap().unwrap().1, long);
         edit_text(&conn, id, "already here", 0).unwrap();
-        assert!(get(&conn, id).unwrap().is_none());
-        assert_eq!(get(&conn, other).unwrap().unwrap().1, "already here");
+        assert!(get(&conn, other).unwrap().is_none());
+        assert_eq!(get(&conn, id).unwrap().unwrap().1, "already here");
     }
 
     #[test]
@@ -1119,5 +1096,109 @@ mod tests {
             .query_row("SELECT use_count FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(uses, 5);
+    }
+
+    #[test]
+    fn deduplication_composes_with_import_transaction_and_rollback() {
+        let mut conn = mem();
+        let id = add(&conn, "original", 8);
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute("INSERT INTO clips(kind,content,hash,size,created_at,updated_at,favorite) VALUES('text','original','old-hash',8,1,2,1)", []).unwrap();
+            deduplicate(&tx).unwrap();
+            assert_eq!(list(&tx, Scope::All, "").unwrap().len(), 1);
+            assert!(list(&tx, Scope::All, "").unwrap()[0].favorite);
+            // Dropping the import transaction restores both the deletion and merged flags.
+        }
+        assert_eq!(list(&conn, Scope::All, "").unwrap().len(), 1);
+        assert_eq!(list(&conn, Scope::All, "").unwrap()[0].id, id);
+        assert!(!list(&conn, Scope::All, "").unwrap()[0].favorite);
+    }
+
+    #[test]
+    fn save_reconciles_hash_when_future_dated_legacy_row_survives() {
+        let conn = mem();
+        conn.execute("INSERT INTO clips(kind,content,hash,size,created_at,updated_at,pinned,pinned_at) VALUES('text','same','old-hash',4,1,9999999999999,1,20)", []).unwrap();
+        let old = conn.last_insert_rowid();
+        assert_eq!(add(&conn, "same", 4), old);
+        assert_eq!(add(&conn, "same", 4), old);
+        let rows = list(&conn, Scope::All, "").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].pinned);
+        assert_eq!(
+            conn.query_row("SELECT pinned_at FROM clips", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            20
+        );
+    }
+
+    #[test]
+    fn failed_edit_merge_rolls_back_content_flags_and_deletion() {
+        let conn = mem();
+        let id = add(&conn, "original", 8);
+        let duplicate = add(&conn, "target", 6);
+        toggle_favorite(&conn, duplicate).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_merge BEFORE DELETE ON clips BEGIN SELECT RAISE(ABORT,'simulated failure'); END;").unwrap();
+        assert!(edit_text(&conn, id, "target", 0).is_err());
+        assert_eq!(get(&conn, id).unwrap().unwrap().1, "original");
+        assert_eq!(get(&conn, duplicate).unwrap().unwrap().1, "target");
+        assert!(!list(&conn, Scope::All, "original").unwrap()[0].favorite);
+        assert_eq!(
+            conn.query_row("SELECT hash FROM clips WHERE id=?1", [id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            text_hash("original")
+        );
+    }
+
+    #[test]
+    fn startup_repair_handles_many_groups_and_preserves_exact_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = open(&path).unwrap();
+        for index in 0..70 {
+            let text = format!("duplicate {index}");
+            add(&conn, &text, text.len() as i64);
+            conn.execute("INSERT INTO clips(kind,content,hash,size,created_at,updated_at) VALUES('text',?1,?2,10,1,2)", params![text, format!("legacy-{index}")]).unwrap();
+        }
+        let prefix = "x".repeat(400);
+        for text in [
+            format!("{prefix}a"),
+            format!("{prefix}b"),
+            " A ".into(),
+            "a".into(),
+            "A".into(),
+        ] {
+            add(&conn, &text, text.len() as i64);
+        }
+        drop(conn);
+        let repaired = open(&path).unwrap();
+        assert_eq!(list(&repaired, Scope::All, "").unwrap().len(), 75);
+        deduplicate(&repaired).unwrap();
+        assert_eq!(list(&repaired, Scope::All, "").unwrap().len(), 75);
+    }
+
+    #[test]
+    fn duplicate_image_rows_retain_shared_file_reference_and_flags() {
+        let conn = mem();
+        conn.execute_batch("INSERT INTO clips(kind,content,hash,size,created_at,updated_at,favorite) VALUES('image','same.png','legacy-image-a',50,1,10,1);
+            INSERT INTO clips(kind,content,hash,size,created_at,updated_at,pinned) VALUES('image','same.png','legacy-image-b',50,2,20,1);
+            INSERT INTO clips(kind,content,hash,size,created_at,updated_at) VALUES('text','same.png','text-hash',8,3,30);").unwrap();
+        assert!(deduplicate(&conn).unwrap().is_empty());
+        assert!(is_file_referenced(&conn, "same.png").unwrap());
+        let images: Vec<_> = list(&conn, Scope::All, "")
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == KIND_IMAGE)
+            .collect();
+        assert_eq!(images.len(), 1);
+        assert!(images[0].favorite && images[0].pinned);
+        assert_eq!(
+            storage_usage(&conn).unwrap(),
+            StorageUsage {
+                ordinary_bytes: 8,
+                protected_bytes: 50
+            }
+        );
     }
 }
