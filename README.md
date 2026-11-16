@@ -14,6 +14,8 @@
 
 新增 [原生 Android 客户端](android/README.md)，支持文本/图片、收藏、搜索、后台接收及与桌面端加密互传。[内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理；[性能优化与基准](PERFORMANCE.md)记录数据库热点和图片清理优化、测量结果及验证边界。
 
+[与原始仓库的对比及改进建议](UPSTREAM_COMPARISON.md)说明当前 fork 与 Fomovet/clipkeep 的功能差异、待移植修复和验证范围。
+
 ![浅色和深色主界面](assets/screenshots/hero.png)
 
 ---
