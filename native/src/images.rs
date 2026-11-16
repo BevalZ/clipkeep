@@ -3,7 +3,7 @@ use image::{
     ExtendedColorType, ImageBuffer, ImageEncoder, ImageFormat, ImageReader, Limits,
     Rgba as RgbaPixel, codecs::png::PngEncoder, imageops,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::io::{Error as IoError, ErrorKind};
 #[cfg(windows)]
@@ -30,17 +30,38 @@ pub struct Rgba {
     pub pixels: Vec<u8>,
 }
 
-pub struct Saved {
+pub struct Saved<'a> {
     pub hash: String,
     pub file: String,
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
+    // Keep the file alive until the caller has committed its database reference.
+    _pending: PendingImage<'a>,
 }
 
 pub struct ImageStore {
     originals: PathBuf,
     thumbs: PathBuf,
+    pending: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+struct PendingImage<'a> {
+    store: &'a ImageStore,
+    file: String,
+}
+
+impl Drop for PendingImage<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.store.pending.lock()
+            && let Some(count) = pending.get_mut(&self.file)
+        {
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&self.file);
+            }
+        }
+    }
 }
 
 /// Hash of the decoded pixels using blake3 (10x faster than sha256), so the same picture matches
@@ -79,7 +100,7 @@ fn temp_image_file(name: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn is_reparse_point(path: &Path) -> bool {
+pub(crate) fn is_reparse_point(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             #[cfg(windows)]
@@ -155,6 +176,7 @@ impl ImageStore {
         let store = Self {
             originals: data_dir.join("images"),
             thumbs: data_dir.join("thumbs"),
+            pending: std::sync::Mutex::new(HashMap::new()),
         };
         std::fs::create_dir_all(&store.originals)?;
         std::fs::create_dir_all(&store.thumbs)?;
@@ -200,7 +222,7 @@ impl ImageStore {
     }
 
     /// Writes the original and thumbnail if either is missing; cheap when both already exist.
-    pub fn write(&self, img: &Rgba, hash: &str) -> Result<Saved, String> {
+    pub fn write(&self, img: &Rgba, hash: &str) -> Result<Saved<'_>, String> {
         check_size(img.width, img.height)?;
         let expected = (img.width as usize)
             .checked_mul(img.height as usize)
@@ -213,6 +235,14 @@ impl ImageStore {
             return Err("图片标识无效".into());
         }
         let file = Self::file_name(hash);
+        let lease = {
+            let mut pending = self.pending.lock().map_err(|e| e.to_string())?;
+            *pending.entry(file.clone()).or_default() += 1;
+            PendingImage {
+                store: self,
+                file: file.clone(),
+            }
+        };
         let original = self.original_path(hash);
         let thumb = self.thumb_path_for_hash(hash);
         for path in [
@@ -274,6 +304,7 @@ impl ImageStore {
             width: w,
             height: h,
             bytes,
+            _pending: lease,
         })
     }
 
@@ -358,6 +389,14 @@ impl ImageStore {
 
     pub fn remove(&self, file: &str) {
         let Some(hash) = file_hash(file) else { return };
+        // Hold this lock through unlinking, so a new writer either protects the file first
+        // or starts after deletion and recreates it. Never hold it while acquiring the DB.
+        let Ok(pending) = self.pending.lock() else {
+            return;
+        };
+        if pending.contains_key(file) {
+            return;
+        }
         let original = self.original_path(hash);
         let thumb = self.thumb_path_for_hash(hash);
         let legacy_original = self.originals.join(file);
@@ -513,12 +552,62 @@ mod tests {
         assert_eq!(store.load(&saved.file).unwrap().pixels, image.pixels);
         assert_eq!(store.thumb_path(&saved.file), Some(legacy_thumb.clone()));
         assert!(!store.png_bytes(&saved.file).unwrap().is_empty());
-        store.remove(&saved.file);
+        let file = saved.file.clone();
+        drop(saved);
+        store.remove(&file);
         assert!(!store.original_path(&digest).exists());
         assert!(!legacy_original.exists());
         assert!(!legacy_thumb.exists());
         std::fs::remove_dir(store.originals).unwrap();
         std::fs::remove_dir(store.thumbs).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_duplicate_save_survives_deletion_until_reference_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path()).unwrap();
+        let conn = crate::db::open(&dir.path().join("history.db")).unwrap();
+        let image = Rgba {
+            width: 1,
+            height: 1,
+            pixels: vec![1, 2, 3, 255],
+        };
+        let digest = hash(&image);
+        let save = |saved: &Saved| {
+            crate::db::upsert(
+                &conn,
+                &crate::db::NewClip {
+                    kind: crate::db::KIND_IMAGE,
+                    content: &saved.file,
+                    hash: &saved.hash,
+                    width: Some(saved.width),
+                    height: Some(saved.height),
+                    size: saved.bytes as i64,
+                    source: None,
+                },
+                0,
+            )
+            .unwrap();
+        };
+        let first = store.write(&image, &digest).unwrap();
+        save(&first);
+        drop(first);
+        let pending = store.write(&image, &digest).unwrap();
+        let other = store.write(&image, &digest).unwrap();
+        drop(other); // Each concurrent save owns its protection independently.
+        let id = crate::db::last_clip_id(&conn).unwrap();
+        for file in crate::db::delete(&conn, id).unwrap() {
+            store.remove(&file);
+        }
+        save(&pending);
+        let file = pending.file.clone();
+        drop(pending);
+        assert_eq!(store.load(&file).unwrap().pixels, image.pixels);
+        assert!(crate::db::is_file_referenced(&conn, &file).unwrap());
+        for file in crate::db::delete(&conn, crate::db::last_clip_id(&conn).unwrap()).unwrap() {
+            store.remove(&file);
+        }
+        assert!(store.load(&file).is_err());
     }
 }

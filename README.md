@@ -12,7 +12,7 @@
 
 > Windows 桌面端采用 Rust + Tauri 2；Android 采用原生 Java。支持本地历史、搜索和局域网加密文本互传。MIT 开源。
 
-新增 [原生 Android 客户端](android/README.md)，支持文本/图片、收藏、搜索、后台接收及与桌面端加密互传。本次 [内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理。
+新增 [原生 Android 客户端](android/README.md)，支持文本/图片、收藏、搜索、后台接收及与桌面端加密互传。[内存优化与测量](MEMORY.md)覆盖备份导入、列表、托盘页面和图片处理；[性能优化与基准](PERFORMANCE.md)记录数据库热点和图片清理优化、测量结果及验证边界。
 
 ![浅色和深色主界面](assets/screenshots/hero.png)
 

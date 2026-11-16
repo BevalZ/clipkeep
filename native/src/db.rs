@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PREVIEW_CHARS: usize = 400;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const LIST_LIMIT: i64 = 1000;
 
 /// Favorites, pinned, and grouped items are kept forever and don't count toward the size budget;
@@ -139,6 +139,7 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             0 => migrate_v1(&tx)?,
             1 => migrate_v2(&tx)?,
             2 => migrate_v3(&tx)?,
+            3 => migrate_v4(&tx)?,
             _ => unreachable!(),
         }
         version += 1;
@@ -219,17 +220,84 @@ fn migrate_v3(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
     ))
 }
 
+fn migrate_v4(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    // A bounded key narrows exact-content comparisons without indexing multi-MB bodies.
+    // NULL also supports legacy/raw inserts; repair them before matching or deduplicating.
+    tx.execute_batch(
+        "ALTER TABLE clips ADD COLUMN content_key BLOB;
+         CREATE INDEX idx_clips_match ON clips(kind, content_key);
+         CREATE INDEX idx_clips_missing_key ON clips(id) WHERE content_key IS NULL;
+         CREATE TRIGGER clips_content_changed AFTER UPDATE OF content ON clips
+         WHEN NEW.content IS NOT OLD.content AND NEW.content_key IS OLD.content_key
+         BEGIN UPDATE clips SET content_key=NULL WHERE id=NEW.id; END;
+         CREATE INDEX idx_clips_image_file ON clips(content) WHERE kind='image';
+         CREATE INDEX idx_clips_favorite_order ON clips(pinned DESC,pinned_at DESC,updated_at DESC) WHERE favorite=1;
+         CREATE INDEX idx_clips_group_order ON clips(group_id,pinned DESC,pinned_at DESC,updated_at DESC);",
+    )?;
+    // Triggers cover edits, flags, grouping, imports, deletes and transaction rollback alike.
+    tx.execute_batch(&format!(
+        "CREATE TABLE storage_totals (
+             id INTEGER PRIMARY KEY CHECK(id=1), ordinary_bytes INTEGER NOT NULL, protected_bytes INTEGER NOT NULL
+         );
+         INSERT INTO storage_totals SELECT 1,
+             COALESCE(SUM(CASE WHEN {KEEP_FOREVER} THEN 0 ELSE size END),0),
+             COALESCE(SUM(CASE WHEN {KEEP_FOREVER} THEN size ELSE 0 END),0) FROM clips;"
+    ))?;
+    let old_kept = "(OLD.favorite=1 OR OLD.pinned=1 OR OLD.group_id IS NOT NULL)";
+    let new_kept = "(NEW.favorite=1 OR NEW.pinned=1 OR NEW.group_id IS NOT NULL)";
+    tx.execute_batch(&format!(
+        "CREATE TRIGGER clips_size_insert AFTER INSERT ON clips BEGIN
+             UPDATE storage_totals SET
+                 ordinary_bytes=ordinary_bytes+CASE WHEN {new_kept} THEN 0 ELSE NEW.size END,
+                 protected_bytes=protected_bytes+CASE WHEN {new_kept} THEN NEW.size ELSE 0 END WHERE id=1;
+         END;
+         CREATE TRIGGER clips_size_delete AFTER DELETE ON clips BEGIN
+             UPDATE storage_totals SET
+                 ordinary_bytes=ordinary_bytes-CASE WHEN {old_kept} THEN 0 ELSE OLD.size END,
+                 protected_bytes=protected_bytes-CASE WHEN {old_kept} THEN OLD.size ELSE 0 END WHERE id=1;
+         END;
+         CREATE TRIGGER clips_size_update AFTER UPDATE OF size,favorite,pinned,group_id ON clips
+         WHEN OLD.size IS NOT NEW.size OR OLD.favorite IS NOT NEW.favorite OR OLD.pinned IS NOT NEW.pinned OR OLD.group_id IS NOT NEW.group_id
+         BEGIN
+             UPDATE storage_totals SET
+                 ordinary_bytes=ordinary_bytes-CASE WHEN {old_kept} THEN 0 ELSE OLD.size END+CASE WHEN {new_kept} THEN 0 ELSE NEW.size END,
+                 protected_bytes=protected_bytes-CASE WHEN {old_kept} THEN OLD.size ELSE 0 END+CASE WHEN {new_kept} THEN NEW.size ELSE 0 END WHERE id=1;
+         END;"
+    ))?;
+    repair_content_keys(tx)
+}
+
+fn content_key(content: &str) -> [u8; 32] {
+    *blake3::hash(content.as_bytes()).as_bytes()
+}
+
+fn repair_content_keys(conn: &Connection) -> rusqlite::Result<()> {
+    let mut read = conn.prepare_cached(
+        "SELECT id,content FROM clips WHERE content_key IS NULL ORDER BY id LIMIT 1",
+    )?;
+    let mut write = conn.prepare_cached("UPDATE clips SET content_key=?2 WHERE id=?1")?;
+    while let Some((id, key)) = read
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                content_key(row.get_ref(1)?.as_str()?),
+            ))
+        })
+        .optional()?
+    {
+        write.execute(params![id, &key[..]])?;
+    }
+    Ok(())
+}
+
 pub fn referenced_files(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
     let mut stmt = conn.prepare("SELECT content FROM clips WHERE kind = 'image'")?;
     stmt.query_map([], |r| r.get(0))?.collect()
 }
 
 pub fn is_file_referenced(conn: &Connection, file: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM clips WHERE kind = 'image' AND content = ?1)",
-        params![file],
-        |r| r.get(0),
-    )
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM clips WHERE kind = 'image' AND content = ?1)")?
+        .query_row(params![file], |r| r.get(0))
 }
 
 /// Inserts or bumps an item to the top, then trims loose history over the byte budget
@@ -254,12 +322,14 @@ fn write_atomic<T>(
 
 pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Result<Vec<String>> {
     write_atomic(conn, || {
-        conn.execute(
-            "INSERT INTO clips (kind, content, preview, hash, width, height, size, source, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+        repair_content_keys(conn)?;
+        conn.prepare_cached(
+            "INSERT INTO clips (kind, content, preview, hash, width, height, size, source, created_at, updated_at, content_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)
              ON CONFLICT(hash) DO UPDATE SET updated_at = excluded.updated_at, use_count = use_count + 1",
+        )?.execute(
             params![clip.kind, clip.content, preview_of(clip.kind, clip.content), clip.hash,
-                clip.width, clip.height, clip.size, clip.source, now_ms()],
+                clip.width, clip.height, clip.size, clip.source, now_ms(), &content_key(clip.content)[..]],
         )?;
         let id = conn.query_row("SELECT id FROM clips WHERE hash=?1", [clip.hash], |r| {
             r.get(0)
@@ -267,10 +337,23 @@ pub fn upsert(conn: &Connection, clip: &NewClip, max_bytes: i64) -> rusqlite::Re
         let survivor = merge_equal(conn, id, false)?;
         // A future-dated legacy row may survive. Retain the canonical incoming hash for sync.
         conn.execute(
-            "UPDATE clips SET hash=?2 WHERE id=?1",
+            "UPDATE clips SET hash=?2 WHERE id=?1 AND hash<>?2",
             params![survivor, clip.hash],
         )?;
-        enforce_storage(conn, max_bytes)
+        let trimmed = enforce_storage(conn, max_bytes)?;
+        let retained: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE id=?1)",
+            [survivor],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            // Roll back trimming too: a rejected incoming item must not remove existing history.
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_TOOBIG),
+                Some("容量清理无法保留本次内容，未保存；请调高普通历史容量上限".into()),
+            ));
+        }
+        Ok(trimmed)
     })
 }
 
@@ -281,9 +364,9 @@ fn merge_equal(
     representative: i64,
     keep_identity: bool,
 ) -> rusqlite::Result<i64> {
-    let equal = "kind=(SELECT kind FROM clips WHERE id=?1) AND content=(SELECT content FROM clips WHERE id=?1)";
+    let equal = "kind=(SELECT kind FROM clips WHERE id=?1) AND content_key=(SELECT content_key FROM clips WHERE id=?1) AND content=(SELECT content FROM clips WHERE id=?1)";
     let matches: Vec<i64> = {
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT id FROM clips WHERE {equal} ORDER BY updated_at DESC,id DESC LIMIT 2"
         ))?;
         stmt.query_map([representative], |row| row.get(0))?
@@ -320,10 +403,14 @@ fn merge_equal(
 /// duplicate groups are collected into application memory. Ordinary saves only inspect their item.
 pub fn deduplicate(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     write_atomic(conn, || {
+        repair_content_keys(conn)?;
         loop {
             let ids: Vec<i64> = {
                 let mut stmt = conn.prepare(
-                    "SELECT MIN(id) FROM clips GROUP BY kind,content HAVING COUNT(*)>1 LIMIT 64",
+                    "SELECT MIN(id) FROM clips
+                     WHERE (kind,content_key) IN (
+                         SELECT kind,content_key FROM clips GROUP BY kind,content_key HAVING COUNT(*)>1
+                     ) GROUP BY kind,content_key,content HAVING COUNT(*)>1 LIMIT 64",
                 )?;
                 stmt.query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?
@@ -343,11 +430,7 @@ pub fn enforce_storage(conn: &Connection, max_bytes: i64) -> rusqlite::Result<Ve
     if max_bytes <= 0 {
         return Ok(Vec::new());
     }
-    let total: i64 = conn.query_row(
-        &format!("SELECT COALESCE(SUM(size), 0) FROM clips WHERE NOT {KEEP_FOREVER}"),
-        [],
-        |r| r.get(0),
-    )?;
+    let total = storage_usage(conn)?.ordinary_bytes;
     if total <= max_bytes {
         return Ok(Vec::new());
     }
@@ -380,20 +463,13 @@ pub fn enforce_storage(conn: &Connection, max_bytes: i64) -> rusqlite::Result<Ve
 
 /// Uses the same eligibility rule as automatic cleanup, so the displayed quota matches trimming.
 pub fn storage_usage(conn: &Connection) -> rusqlite::Result<StorageUsage> {
-    conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(CASE WHEN {KEEP_FOREVER} THEN 0 ELSE size END), 0),
-                    COALESCE(SUM(CASE WHEN {KEEP_FOREVER} THEN size ELSE 0 END), 0)
-             FROM clips"
-        ),
-        [],
-        |row| {
+    conn.prepare_cached("SELECT ordinary_bytes,protected_bytes FROM storage_totals WHERE id=1")?
+        .query_row([], |row| {
             Ok(StorageUsage {
                 ordinary_bytes: row.get(0)?,
                 protected_bytes: row.get(1)?,
             })
-        },
-    )
+        })
 }
 
 fn delete_where(
@@ -413,31 +489,44 @@ fn delete_where(
 }
 
 pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Vec<Clip>> {
-    let mut filters: Vec<String> = Vec::new();
-    match scope {
-        Scope::All => {}
-        Scope::Favorites => filters.push("favorite = 1".into()),
-        Scope::Group(id) => filters.push(format!("group_id = {id}")),
-    }
+    let mut filters = Vec::new();
+    let mut args = Vec::<rusqlite::types::Value>::new();
+    let order_index = match scope {
+        Scope::All => "idx_clips_order",
+        Scope::Favorites => {
+            filters.push("favorite = 1");
+            "idx_clips_favorite_order"
+        }
+        Scope::Group(id) => {
+            filters.push("group_id = ?");
+            args.push(id.into());
+            "idx_clips_group_order"
+        }
+    };
     if !query.is_empty() {
-        filters.push("(kind = 'text' AND content LIKE ?1 ESCAPE '\\')".into());
+        filters.push("(kind = 'text' AND content LIKE ? ESCAPE '\\')");
+        args.push(
+            format!(
+                "%{}%",
+                query
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+            .into(),
+        );
     }
     let where_clause = if filters.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", filters.join(" AND "))
     };
+    // A leading-wildcard search cannot use a text index. Walk in display order so the new
+    // content-key index does not turn a common kind='text' filter into random body reads + sort.
     let sql = format!(
         "SELECT id, kind, CASE WHEN kind = 'image' THEN content ELSE COALESCE(preview, '') END,
                 size, length(CAST(preview AS BLOB)) < size, width, height, favorite, pinned, updated_at, source, group_id
-         FROM clips {where_clause} {ORDER} LIMIT {LIST_LIMIT}"
-    );
-    let pattern = format!(
-        "%{}%",
-        query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
+         FROM clips INDEXED BY {order_index} {where_clause} {ORDER} LIMIT {LIST_LIMIT}"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let map = |r: &rusqlite::Row| {
@@ -466,11 +555,7 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
             thumb: None,
         })
     };
-    let rows = if query.is_empty() {
-        stmt.query_map([], map)?
-    } else {
-        stmt.query_map(params![pattern], map)?
-    };
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), map)?;
     rows.collect()
 }
 
@@ -509,15 +594,17 @@ pub fn edit_text(
     }
     let hash = text_hash(text);
     write_atomic(conn, || {
+        repair_content_keys(conn)?;
         // Change content first while retaining the old unique hash until duplicate rows are gone.
         conn.execute(
-            "UPDATE clips SET content=?2, preview=?3, size=?4, updated_at=?5 WHERE id=?1",
+            "UPDATE clips SET content=?2, preview=?3, size=?4, updated_at=?5, content_key=?6 WHERE id=?1",
             params![
                 id,
                 text,
                 preview_of(KIND_TEXT, text),
                 text.len() as i64,
-                now_ms()
+                now_ms(),
+                &content_key(text)[..]
             ],
         )?;
         merge_equal(conn, id, true)?;
@@ -699,9 +786,9 @@ pub fn import_clip(conn: &Connection, c: &RawClip) -> rusqlite::Result<()> {
     let stamp = now_ms();
     let fav_at = c.favorite.then_some(stamp);
     let pinned_at = c.pinned.then_some(stamp);
-    conn.execute(
-        "INSERT INTO clips (kind, content, preview, hash, width, height, size, favorite, fav_at, pinned, pinned_at, group_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+    conn.prepare_cached(
+        "INSERT INTO clips (kind, content, preview, hash, width, height, size, favorite, fav_at, pinned, pinned_at, group_id, created_at, updated_at, content_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(hash) DO UPDATE SET
              favorite = MAX(favorite, excluded.favorite),
              fav_at = COALESCE(fav_at, excluded.fav_at),
@@ -709,9 +796,10 @@ pub fn import_clip(conn: &Connection, c: &RawClip) -> rusqlite::Result<()> {
              pinned_at = COALESCE(pinned_at, excluded.pinned_at),
              group_id = COALESCE(group_id, excluded.group_id),
              updated_at = MAX(updated_at, excluded.updated_at)",
+    )?.execute(
         params![
             c.kind, c.content, preview_of(&c.kind, &c.content), c.hash, c.width, c.height, c.size,
-            c.favorite as i64, fav_at, c.pinned as i64, pinned_at, c.group_id, c.created_at, c.updated_at
+            c.favorite as i64, fav_at, c.pinned as i64, pinned_at, c.group_id, c.created_at, c.updated_at, &content_key(&c.content)[..]
         ],
     )?;
     Ok(())
@@ -721,10 +809,199 @@ pub fn import_clip(conn: &Connection, c: &RawClip) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
 
+    fn assert_totals(conn: &Connection) {
+        let expected = conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(CASE WHEN {KEEP_FOREVER} THEN 0 ELSE size END),0),
+                    COALESCE(SUM(CASE WHEN {KEEP_FOREVER} THEN size ELSE 0 END),0) FROM clips"
+                ),
+                [],
+                |row| {
+                    Ok(StorageUsage {
+                        ordinary_bytes: row.get(0)?,
+                        protected_bytes: row.get(1)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(storage_usage(conn).unwrap(), expected);
+    }
+
+    #[test]
+    fn incremental_totals_match_full_scan_through_mutations_and_rollback() {
+        let conn = mem();
+        let group = create_group(&conn, "kept").unwrap();
+        let mut seed = 17u64;
+        for step in 0..300 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let text = format!("entry {} 中😀", (seed >> 32) % 40);
+            let id = add(&conn, &text, text.len() as i64);
+            match step % 9 {
+                0 => {
+                    toggle_favorite(&conn, id).unwrap();
+                }
+                1 => {
+                    toggle_pinned(&conn, id).unwrap();
+                }
+                2 => {
+                    set_group(&conn, id, Some(group.id)).unwrap();
+                }
+                3 => {
+                    set_group(&conn, id, None).unwrap();
+                }
+                4 => {
+                    edit_text(&conn, id, &format!("edited {step}"), 0).unwrap();
+                }
+                5 => {
+                    delete(&conn, id).unwrap();
+                }
+                6 => {
+                    enforce_storage(&conn, 200).unwrap();
+                }
+                7 => {
+                    let before = storage_usage(&conn).unwrap();
+                    {
+                        let tx = conn.unchecked_transaction().unwrap();
+                        clear_data(&tx, true, true, true).unwrap();
+                        add(&tx, "rolled back", 11);
+                        assert_totals(&tx);
+                    }
+                    assert_eq!(storage_usage(&conn).unwrap(), before);
+                }
+                _ => {
+                    clear_data(&conn, false, false, false).unwrap();
+                }
+            }
+            assert_totals(&conn);
+        }
+        delete_group(&conn, group.id, false).unwrap();
+        assert_totals(&conn);
+        let text = "x".repeat(300);
+        let before = storage_usage(&conn).unwrap();
+        assert!(
+            upsert(
+                &conn,
+                &NewClip {
+                    kind: KIND_TEXT,
+                    content: &text,
+                    hash: &text_hash(&text),
+                    width: None,
+                    height: None,
+                    size: 300,
+                    source: None
+                },
+                100
+            )
+            .is_err()
+        );
+        assert_eq!(storage_usage(&conn).unwrap(), before);
+        assert_totals(&conn);
+    }
+
+    #[test]
+    fn indexed_match_still_compares_exact_content_on_digest_collision() {
+        let conn = mem();
+        let prefix = "同样的预览😀".repeat(100);
+        let first = format!("{prefix}one");
+        let second = format!("{prefix}two");
+        let a = add(&conn, &first, first.len() as i64);
+        let b = add(&conn, &second, second.len() as i64);
+        // Deliberately manufacture a hash collision: equality must still use the entire body.
+        conn.execute(
+            "UPDATE clips SET content_key=?1 WHERE id=?2",
+            params![&content_key(&first)[..], b],
+        )
+        .unwrap();
+        deduplicate(&conn).unwrap();
+        assert_eq!(add(&conn, &first, first.len() as i64), a);
+        assert_eq!(get(&conn, b).unwrap().unwrap().1, second);
+        assert_eq!(list(&conn, Scope::All, "").unwrap().len(), 2);
+        // Raw legacy edits invalidate their old lookup key and are repaired before matching.
+        conn.execute("UPDATE clips SET content=?1 WHERE id=?2", params![first, b])
+            .unwrap();
+        deduplicate(&conn).unwrap();
+        assert_eq!(list(&conn, Scope::All, "").unwrap().len(), 1);
+        assert_totals(&conn);
+    }
+
+    #[test]
+    fn v3_upgrade_is_atomic_and_preserves_content() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            migrate_v1(&tx).unwrap();
+            migrate_v2(&tx).unwrap();
+            migrate_v3(&tx).unwrap();
+            tx.execute("INSERT INTO clips(kind,content,hash,size,created_at,updated_at,favorite) VALUES('text',?1,'legacy',17,1,2,1)", ["中\0文😀"] ).unwrap();
+            tx.pragma_update(None, "user_version", 3).unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("CREATE TRIGGER fail_key BEFORE UPDATE ON clips BEGIN SELECT RAISE(ABORT,'simulated migration failure'); END;").unwrap();
+        assert!(migrate(&mut conn).is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('clips') WHERE name='content_key'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(get(&conn, 1).unwrap().unwrap().1, "中\0文😀");
+        conn.execute_batch("DROP TRIGGER fail_key").unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(get(&conn, 1).unwrap().unwrap().1, "中\0文😀");
+        assert_eq!(
+            conn.query_row("SELECT content_key FROM clips", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            content_key("中\0文😀")
+        );
+        assert_totals(&conn);
+        assert!(list(&conn, Scope::Favorites, "中").unwrap()[0].favorite);
+        assert!(list(&conn, Scope::Group(99), "中").unwrap().is_empty());
+    }
+
     fn mem() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn rejected_incoming_item_rolls_back_quota_trimming_and_preserves_history() {
+        let conn = mem();
+        let original = add(&conn, "keep", 4);
+        let text = "x".repeat(1_500_000);
+        let clip = NewClip {
+            kind: KIND_TEXT,
+            content: &text,
+            hash: &text_hash(&text),
+            width: None,
+            height: None,
+            size: text.len() as i64,
+            source: Some("局域网"),
+        };
+        assert!(
+            upsert(&conn, &clip, 1024 * 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("未保存")
+        );
+        assert_eq!(texts(&conn), vec!["keep"]);
+        assert!(get(&conn, original).unwrap().is_some());
+        upsert(&conn, &clip, 0).unwrap();
+        let id = last_clip_id(&conn).unwrap();
+        toggle_favorite(&conn, id).unwrap();
+        // A previously protected item remains valid even when larger than the ordinary quota.
+        upsert(&conn, &clip, 1024 * 1024).unwrap();
+        assert_eq!(get(&conn, id).unwrap().unwrap().1, text);
     }
 
     #[test]

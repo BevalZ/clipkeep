@@ -28,6 +28,34 @@ pub struct Settings {
     pub theme: Theme,
 }
 
+/// Only user-editable fields cross IPC; omitted fields keep their current values.
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SettingsPatch {
+    hotkey_enabled: Option<bool>,
+    hotkey: Option<String>,
+    capture_images: Option<bool>,
+    remember_position: Option<bool>,
+    keep_on_blur: Option<bool>,
+    max_storage_mb: Option<u64>,
+    theme: Option<Theme>,
+}
+
+impl SettingsPatch {
+    pub fn apply(self, current: &Settings) -> Settings {
+        Settings {
+            hotkey_enabled: self.hotkey_enabled.unwrap_or(current.hotkey_enabled),
+            hotkey: self.hotkey.unwrap_or_else(|| current.hotkey.clone()),
+            capture_images: self.capture_images.unwrap_or(current.capture_images),
+            remember_position: self.remember_position.unwrap_or(current.remember_position),
+            keep_on_blur: self.keep_on_blur.unwrap_or(current.keep_on_blur),
+            max_storage_mb: self.max_storage_mb.unwrap_or(current.max_storage_mb),
+            theme: self.theme.unwrap_or(current.theme),
+            ..current.clone()
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -120,6 +148,23 @@ impl SettingsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_patches_preserve_other_changes_and_window_position() {
+        let initial = Settings {
+            window_x: Some(123),
+            window_y: Some(456),
+            ..Settings::default()
+        };
+        let first: SettingsPatch = serde_json::from_str(r#"{"keepOnBlur":true}"#).unwrap();
+        let second: SettingsPatch = serde_json::from_str(r#"{"rememberPosition":true}"#).unwrap();
+        let result = second.apply(&first.apply(&initial));
+        assert!(result.keep_on_blur && result.remember_position);
+        assert_eq!((result.window_x, result.window_y), (Some(123), Some(456)));
+        assert_eq!(result.max_storage_mb, initial.max_storage_mb);
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"windowX":0}"#).is_err());
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"maxStorageMb":-1}"#).is_err());
+    }
 
     #[test]
     fn one_bad_field_does_not_reset_the_rest() {

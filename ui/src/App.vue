@@ -525,6 +525,8 @@ function cycleTab(dir: number) {
 }
 
 function onKey(e: KeyboardEvent) {
+  // IME confirmation/navigation belongs to the input method, including WebView's 229 fallback.
+  if (e.isComposing || e.keyCode === 229) return;
   if (previewClip.value) {
     if (e.key === "Escape") {
       closePreview();

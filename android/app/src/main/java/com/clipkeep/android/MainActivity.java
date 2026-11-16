@@ -263,7 +263,7 @@ public final class MainActivity extends Activity {
         });
     }
     private void copy(long id) {
-        task(() -> app.store.isImage(id) ? ClipData.newUri(getContentResolver(), "clipkeep 图片", ImageProvider.uri(id))
+        task(() -> app.store.isImage(id) ? ClipData.newUri(getContentResolver(), "clipkeep 图片", ImageProvider.uri(app.store, id))
                 : ClipData.newPlainText("clipkeep", app.store.text(id)), data -> {
             try { getSystemService(ClipboardManager.class).setPrimaryClip(data); toast("已复制，可到其他应用粘贴"); }
             catch (RuntimeException error) { toast("系统剪贴板无法接收，请使用设备发送"); }
@@ -280,10 +280,11 @@ public final class MainActivity extends Activity {
         });
     }
     private void shareImage(long id) {
-        android.net.Uri uri = ImageProvider.uri(id);
-        Intent intent = new Intent(Intent.ACTION_SEND).setType("image/png").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        intent.setClipData(ClipData.newUri(getContentResolver(), "clipkeep 图片", uri));
-        startActivity(Intent.createChooser(intent, "分享图片"));
+        task(() -> ImageProvider.uri(app.store, id), uri -> {
+            Intent intent = new Intent(Intent.ACTION_SEND).setType("image/png").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            intent.setClipData(ClipData.newUri(getContentResolver(), "clipkeep 图片", uri));
+            startActivity(Intent.createChooser(intent, "分享图片"));
+        });
     }
     private void clipActions(ClipStore.Row clip) {
         String[] choices = {"复制", "预览", clip.favorite ? "取消收藏" : "收藏", clip.pinned ? "取消置顶" : "置顶", "发送到设备", "系统分享", "删除"};

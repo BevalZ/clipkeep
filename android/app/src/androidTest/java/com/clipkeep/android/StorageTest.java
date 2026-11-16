@@ -105,10 +105,52 @@ public class StorageTest {
         assertEquals(75, store.list("", false, 0).size());
     }
     private byte[] png() {
+        return png(android.graphics.Color.RED);
+    }
+    private byte[] png(int color) {
         android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888);
-        bitmap.eraseColor(android.graphics.Color.RED);
+        bitmap.eraseColor(color);
         ByteArrayOutputStream out = new ByteArrayOutputStream(); bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out); bitmap.recycle();
         return out.toByteArray();
+    }
+    @Test public void testImageUriCannotReadReplacementAfterRowIdReuse() throws Exception {
+        long first = store.saveImage(png());
+        android.net.Uri old = ImageProvider.uri(store, first);
+        assertEquals(store.imageFile(first), ImageProvider.resolve(store, old));
+        store.delete(first);
+        assertThrows(FileNotFoundException.class, () -> ImageProvider.resolve(store, old));
+        long replacement = store.saveImage(png(android.graphics.Color.BLUE));
+        assertEquals(first, replacement); // Reproduce SQLite's reuse of the maximum row ID.
+        android.net.Uri current = ImageProvider.uri(store, replacement);
+        assertNotEquals(old, current);
+        assertThrows(FileNotFoundException.class, () -> ImageProvider.resolve(store, old));
+        assertEquals(store.imageFile(replacement), ImageProvider.resolve(store, current));
+        android.net.Uri legacy = android.net.Uri.parse("content://" + ImageProvider.AUTHORITY + "/" + first);
+        assertThrows(FileNotFoundException.class, () -> ImageProvider.resolve(store, legacy));
+    }
+    @Test public void testFailedImageSaveIsCleanedOnNextTextSave() throws Exception {
+        long kept = store.saveImage(png(android.graphics.Color.BLUE));
+        File keptFile = store.imageFile(kept);
+        store.toggle(kept, true);
+        android.database.sqlite.SQLiteDatabase db = store.getWritableDatabase();
+        db.execSQL("CREATE TRIGGER fail_image BEFORE INSERT ON clips WHEN NEW.kind=1 BEGIN SELECT RAISE(ABORT,'simulated failure'); END");
+        assertThrows(Exception.class, () -> store.saveImage(png()));
+        db.execSQL("DROP TRIGGER fail_image");
+        store.save("retry orphan cleanup");
+        assertTrue(keptFile.exists());
+        File[] files = keptFile.getParentFile().listFiles();
+        assertNotNull(files); assertEquals(1, files.length);
+    }
+    @Test public void testQuotaTrimmingAndDeletingImagesStillRemoveFiles() throws Exception {
+        long id = store.saveImage(png()); File file = store.imageFile(id);
+        // Exercise the exact quota path without writing 50 MB of fixture images.
+        store.getWritableDatabase().execSQL("UPDATE clips SET bytes=? WHERE _id=?", new Object[]{ClipStore.DEFAULT_QUOTA, id});
+        store.save("forces image trimming");
+        assertFalse(file.exists());
+        id = store.saveImage(png()); file = store.imageFile(id);
+        store.save("unrelated text"); store.toggle(id, true);
+        assertTrue(file.exists());
+        store.delete(id); assertFalse(file.exists());
     }
     @Test public void testImagesProviderAndProtection() throws Exception {
         byte[] png = png(); long id = store.saveImage(png);

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, type LanState, type Settings, type SettingsView, type StorageUsage, type Theme } from "../api";
+import { api, type LanState, type SettingsPatch, type SettingsView, type StorageUsage, type Theme } from "../api";
 import ClipIcon from "./ClipIcon.vue";
 
 defineEmits<{ back: [] }>();
@@ -33,6 +33,7 @@ let clearTimer: number | undefined;
 let noticeTimer: number | undefined;
 let storageTimer: number | undefined;
 let storageRequest = 0;
+let settingsRequest = 0;
 let disposed = false;
 const unlisteners: UnlistenFn[] = [];
 
@@ -75,23 +76,29 @@ function queueStorageRefresh() {
   storageTimer = window.setTimeout(() => { void refreshStorageUsage(); }, 120);
 }
 
-async function load() {
+async function load(request?: number) {
   const v = await api.getSettings();
-  if (disposed) return;
+  if (disposed || (request !== undefined && request !== settingsRequest)) return;
   view.value = v;
   storageDraft.value = v.settings.maxStorageMb;
 }
 
-async function save(patch: Partial<Settings>) {
+async function save(patch: SettingsPatch) {
   if (!view.value) return;
+  const request = ++settingsRequest;
+  view.value.settings = { ...view.value.settings, ...patch };
   error.value = "";
   try {
-    view.value.settings = await api.updateSettings({ ...view.value.settings, ...patch });
+    const saved = await api.updateSettings(patch);
+    if (disposed || request !== settingsRequest) return;
+    view.value.settings = saved;
     storageDraft.value = view.value.settings.maxStorageMb;
   } catch (e) {
+    if (disposed) return;
     error.value = String(e);
+    if (request !== settingsRequest) return;
     try {
-      await load();
+      await load(request);
     } catch (reloadError) {
       error.value += `；重新读取设置失败：${String(reloadError)}`;
     }

@@ -63,6 +63,15 @@ export interface LanState {
 
 export type Scope = "all" | "fav" | "group";
 
+export type SettingsPatch = Partial<Omit<Settings, "windowX" | "windowY">>;
+// Keep ordering across component unmounts too; each caller still receives its own failure.
+let settingsWrites: Promise<unknown> = Promise.resolve();
+function updateSettings(patch: SettingsPatch): Promise<Settings> {
+  const result = settingsWrites.then(() => invoke<Settings>("update_settings", { patch }));
+  settingsWrites = result.catch(() => {});
+  return result;
+}
+
 export const api = {
   listClips: (scope: Scope, groupId: number | null, query: string) =>
     invoke<Clip[]>("list_clips", { scope, groupId, query }),
@@ -97,9 +106,12 @@ export const api = {
   toggleKeepOnBlur: () => invoke<boolean>("toggle_keep_on_blur"),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
-  getSettings: () => invoke<SettingsView>("get_settings"),
+  getSettings: async () => {
+    await settingsWrites;
+    return invoke<SettingsView>("get_settings");
+  },
   getStorageUsage: () => invoke<StorageUsage>("get_storage_usage"),
-  updateSettings: (settings: Settings) => invoke<Settings>("update_settings", { settings }),
+  updateSettings,
   exportData: () => invoke<string | null>("export_data"),
   importData: () => invoke<string | null>("import_data"),
 };

@@ -6,6 +6,7 @@ mod images;
 mod lan;
 mod lan_address;
 mod lan_wire;
+mod recovery;
 mod settings;
 #[cfg(windows)]
 mod win;
@@ -21,7 +22,7 @@ use db::{Group, NewClip, RawClip, Scope};
 use images::ImageStore;
 use rusqlite::Connection;
 use serde::Serialize;
-use settings::{Settings, SettingsFile};
+use settings::{Settings, SettingsFile, SettingsPatch};
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 #[cfg(windows)]
@@ -243,34 +244,45 @@ fn scope_of(scope: &str, group_id: Option<i64>) -> Scope {
 }
 
 #[tauri::command]
-fn list_clips(
-    core: State<Core>,
+async fn list_clips(
+    app: AppHandle,
     scope: String,
     group_id: Option<i64>,
     query: String,
 ) -> CmdResult<Vec<db::Clip>> {
-    let mut clips =
-        db::list(&*core.conn()?, scope_of(&scope, group_id), query.trim()).map_err(to_err)?;
-    for clip in &mut clips {
-        if let Some(file) = &clip.file {
-            clip.thumb = core
-                .images
-                .thumb_path(file)
-                .map(|path| path.to_string_lossy().into_owned());
+    // Full substring searches and thumbnail filesystem checks must not occupy the UI thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        let mut clips =
+            db::list(&*core.conn()?, scope_of(&scope, group_id), query.trim()).map_err(to_err)?;
+        for clip in &mut clips {
+            if let Some(file) = &clip.file {
+                clip.thumb = core
+                    .images
+                    .thumb_path(file)
+                    .map(|path| path.to_string_lossy().into_owned());
+            }
         }
-    }
-    Ok(clips)
+        Ok(clips)
+    })
+    .await
+    .map_err(to_err)?
 }
 
 #[tauri::command]
-fn get_clip_text(core: State<Core>, id: i64) -> CmdResult<String> {
-    let (kind, text) = db::get(&*core.conn()?, id)
-        .map_err(to_err)?
-        .ok_or("条目不存在")?;
-    if kind != db::KIND_TEXT {
-        return Err("只能预览文本条目".into());
-    }
-    Ok(text)
+async fn get_clip_text(app: AppHandle, id: i64) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        let (kind, text) = db::get(&*core.conn()?, id)
+            .map_err(to_err)?
+            .ok_or("条目不存在")?;
+        if kind != db::KIND_TEXT {
+            return Err("只能预览文本条目".into());
+        }
+        Ok(text)
+    })
+    .await
+    .map_err(to_err)?
 }
 
 #[tauri::command]
@@ -701,12 +713,10 @@ fn get_storage_usage(core: State<Core>) -> CmdResult<StorageUsageView> {
 }
 
 #[tauri::command]
-fn update_settings(app: AppHandle, core: State<Core>, settings: Settings) -> CmdResult<Settings> {
+fn update_settings(app: AppHandle, core: State<Core>, patch: SettingsPatch) -> CmdResult<Settings> {
     let mut current = core.settings.write().map_err(to_err)?;
     let old = current.clone();
-    let mut new = settings;
-    new.window_x = old.window_x;
-    new.window_y = old.window_y;
+    let new = patch.apply(&old);
     if win::hotkey_label(&new.hotkey).is_none() {
         return Err("未知的快捷键".into());
     }
@@ -1253,37 +1263,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Only confirmed corruption starts a fresh database. I/O, permission, and schema-version
-/// errors must preserve the existing history for diagnosis or a newer app version.
-fn open_db(data_dir: &std::path::Path) -> CmdResult<Connection> {
-    let path = data_dir.join("clipkeep.db");
-    match db::open(&path) {
-        Ok(conn) => Ok(conn),
-        Err(e)
-            if matches!(
-                &e,
-                rusqlite::Error::SqliteFailure(error, _)
-                    if matches!(error.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
-            ) =>
-        {
-            eprintln!("history DB unusable ({e}); starting a fresh one");
-            let stamp = chrono_stamp();
-            for suffix in ["", "-wal", "-shm"] {
-                let from = data_dir.join(format!("clipkeep.db{suffix}"));
-                if from.exists() {
-                    std::fs::rename(
-                        &from,
-                        data_dir.join(format!("clipkeep-corrupt-{stamp}.db{suffix}")),
-                    )
-                    .map_err(|error| format!("无法保留损坏的历史数据库：{error}"))?;
-                }
-            }
-            db::open(&path).map_err(to_err)
-        }
-        Err(error) => Err(format!("打开历史数据库失败，原文件已保留：{error}")),
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -1331,7 +1310,7 @@ pub fn run() {
             }
             build_tray(&handle)?;
 
-            let db = open_db(&data_dir).map_err(std::io::Error::other)?;
+            let (db, recovered) = recovery::open(&data_dir).map_err(std::io::Error::other)?;
             let images = ImageStore::new(&data_dir)?;
             // One-time cleanup: drop files left behind by a crash between writing and saving a row.
             if let Ok(referenced) = db::referenced_files(&db) {
@@ -1348,6 +1327,11 @@ pub fn run() {
                 data_dir,
             };
             app.manage(core);
+            if let Some(archive) = recovered {
+                handle.dialog().message(format!(
+                    "历史数据库损坏，已创建新的历史。旧数据库和原图均已保留在：\n{}\n请保留此目录以便恢复数据。", archive.display()
+                )).title("历史数据已保留").show(|_| {});
+            }
             handle.state::<Core>().lan.restore(&handle);
 
             let monitor_handle = handle.clone();

@@ -22,6 +22,7 @@ final class ClipStore extends SQLiteOpenHelper {
         }
     }
     private final File images;
+    private boolean imagesDirty = true;
     ClipStore(Context context) { super(context, "history.db", null, 3); images = new File(context.getFilesDir(), "images"); setWriteAheadLoggingEnabled(true); }
     @Override public void onConfigure(SQLiteDatabase db) {
         db.execSQL("PRAGMA cache_size=-2048");
@@ -31,6 +32,10 @@ final class ClipStore extends SQLiteOpenHelper {
     }
     @Override public void onOpen(SQLiteDatabase db) {
         super.onOpen(db);
+        // Additive indexes also accelerate existing installations without changing row identities.
+        db.execSQL("CREATE INDEX IF NOT EXISTS clips_image_file ON clips(content) WHERE kind=1");
+        db.execSQL("CREATE INDEX IF NOT EXISTS clips_loose_bytes ON clips(updated,_id,bytes) WHERE favorite=0 AND pinned=0");
+        db.execSQL("CREATE INDEX IF NOT EXISTS clips_favorites_order ON clips(pinned DESC,updated DESC,_id DESC) WHERE favorite=1");
         deduplicate(db);
     }
     @Override public void onCreate(SQLiteDatabase db) {
@@ -64,25 +69,28 @@ final class ClipStore extends SQLiteOpenHelper {
             long survivor = mergeEqual(db, idForHash(hash));
             ContentValues canonical = new ContentValues(); canonical.put("hash", hash);
             db.update("clips", canonical, "_id=?", new String[]{Long.toString(survivor)});
-            trim(db);
+            imagesDirty |= trim(db);
             db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
-        collectImages();
+        collectImagesIfNeeded();
         return idForHash(hash);
     }
-    private void trim(SQLiteDatabase db) {
+    private boolean trim(SQLiteDatabase db) {
+        boolean removedImages = false;
         long total = DatabaseUtilsCompat.longQuery(db, "SELECT COALESCE(SUM(bytes),0) FROM clips WHERE favorite=0 AND pinned=0");
         // Bounded ID batches, never full text bodies.
         while (total > DEFAULT_QUOTA) {
             ArrayList<long[]> batch = new ArrayList<>(64);
-            try (Cursor c = db.rawQuery("SELECT _id,bytes FROM clips WHERE favorite=0 AND pinned=0 ORDER BY updated,_id LIMIT 64", null)) {
+            try (Cursor c = db.rawQuery("SELECT _id,bytes,kind FROM clips WHERE favorite=0 AND pinned=0 ORDER BY updated,_id LIMIT 64", null)) {
                 while (c.moveToNext() && total > DEFAULT_QUOTA) {
                     batch.add(new long[]{c.getLong(0), c.getLong(1)}); total -= c.getLong(1);
+                    removedImages |= c.getInt(2) == 1;
                 }
             }
             if (batch.isEmpty()) break;
             for (long[] row : batch) db.delete("clips", "_id=?", new String[]{Long.toString(row[0])});
         }
+        return removedImages;
     }
     synchronized List<Row> list(String query, boolean favorites, int offset) {
         String where = favorites ? "favorite=1" : "1=1";
@@ -122,11 +130,18 @@ final class ClipStore extends SQLiteOpenHelper {
         db.beginTransaction();
         try {
             db.execSQL("UPDATE clips SET " + column + "=1-" + column + " WHERE _id=?", new Object[]{id});
-            trim(db); db.setTransactionSuccessful();
+            imagesDirty |= trim(db); db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
-        collectImages();
+        collectImagesIfNeeded();
     }
-    synchronized void delete(long id) { getWritableDatabase().delete("clips", "_id=?", new String[]{Long.toString(id)}); collectImages(); }
+    synchronized void delete(long id) {
+        SQLiteDatabase db = getWritableDatabase();
+        try (Cursor c = db.rawQuery("SELECT kind FROM clips WHERE _id=?", new String[]{Long.toString(id)})) {
+            if (c.moveToFirst()) imagesDirty |= c.getInt(0) == 1;
+        }
+        db.delete("clips", "_id=?", new String[]{Long.toString(id)});
+        collectImagesIfNeeded();
+    }
     synchronized void clearHistory() { getWritableDatabase().delete("clips", "favorite=0 AND pinned=0", null); collectImages(); }
 
     private long idForHash(String hash) throws IOException {
@@ -154,6 +169,15 @@ final class ClipStore extends SQLiteOpenHelper {
         try (InputStream input = new FileInputStream(imageFile(id))) { return Images.read(input); }
     }
     synchronized long saveImage(byte[] png) throws Exception {
+        try {
+            return saveImageInternal(png);
+        } catch (Exception error) {
+            // A failed DB commit can leave a fully written file. Retry cleanup on the next operation.
+            imagesDirty = true;
+            throw error;
+        }
+    }
+    private long saveImageInternal(byte[] png) throws Exception {
         Images.validate(png);
         byte[] digest = MessageDigest.getInstance("SHA-256").digest(png);
         StringBuilder hex = new StringBuilder(); for (byte value : digest) hex.append(String.format(Locale.ROOT, "%02x", value & 255));
@@ -178,13 +202,18 @@ final class ClipStore extends SQLiteOpenHelper {
             long survivor = mergeEqual(db, idForHash(hash));
             ContentValues canonical = new ContentValues(); canonical.put("hash", hash);
             db.update("clips", canonical, "_id=?", new String[]{Long.toString(survivor)});
-            trim(db); db.setTransactionSuccessful();
+            imagesDirty |= trim(db); db.setTransactionSuccessful();
         } finally { db.endTransaction(); }
-        collectImages(); return idForHash(hash);
+        collectImagesIfNeeded(); return idForHash(hash);
     }
+    private void collectImagesIfNeeded() { if (imagesDirty) collectImages(); }
     synchronized void collectImages() {
         // Iterate directory entries without retaining every filename in memory.
-        if (!images.isDirectory()) return;
+        imagesDirty = true;
+        if (!images.isDirectory()) {
+            if (Files.notExists(images.toPath())) imagesDirty = false;
+            return;
+        }
         try (DirectoryStream<Path> files = Files.newDirectoryStream(images.toPath())) {
             for (Path file : files) {
                 String name = file.getFileName().toString();
@@ -192,7 +221,8 @@ final class ClipStore extends SQLiteOpenHelper {
                     if (!c.moveToFirst()) Files.deleteIfExists(file);
                 }
             }
-        } catch (IOException ignored) { /* Retry during the next storage operation. */ }
+            imagesDirty = false;
+        } catch (IOException ignored) { imagesDirty = true; /* Retry during the next storage operation. */ }
     }
 
     /** Compare content in SQLite; never materialize large duplicate texts in CursorWindow. */

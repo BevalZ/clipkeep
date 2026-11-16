@@ -10,12 +10,21 @@ import java.io.*;
 /** Read-only content URIs with per-recipient grants, no broad filesystem exposure. */
 public final class ImageProvider extends ContentProvider {
     static final String AUTHORITY = "com.clipkeep.android.images";
-    static Uri uri(long id) { return Uri.parse("content://" + AUTHORITY + "/" + id); }
-    private File file(Uri uri) throws FileNotFoundException {
+    static Uri uri(ClipStore store, long id) throws IOException {
+        return Uri.parse("content://" + AUTHORITY + "/" + id + "/" + store.imageFile(id).getName());
+    }
+    static File resolve(ClipStore store, Uri uri) throws FileNotFoundException {
         try {
-            if (!AUTHORITY.equals(uri.getAuthority()) || uri.getPathSegments().size() != 1) throw new IOException();
-            return ((ClipkeepApp)getContext().getApplicationContext()).store.imageFile(Long.parseLong(uri.getLastPathSegment()));
+            // A row ID can be reused after deletion. Bind grants to immutable image content too.
+            // Legacy ID-only URIs must fail rather than grant access to a replacement image.
+            if (!"content".equals(uri.getScheme()) || !AUTHORITY.equals(uri.getAuthority()) || uri.getPathSegments().size() != 2) throw new IOException();
+            File file = store.imageFile(Long.parseLong(uri.getPathSegments().get(0)));
+            if (!file.getName().equals(uri.getLastPathSegment())) throw new IOException();
+            return file;
         } catch (Exception error) { throw new FileNotFoundException("图片已删除"); }
+    }
+    private File file(Uri uri) throws FileNotFoundException {
+        return resolve(((ClipkeepApp)getContext().getApplicationContext()).store, uri);
     }
     @Override public boolean onCreate() { return true; }
     @Override public String getType(Uri uri) { return "image/png"; }
