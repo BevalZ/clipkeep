@@ -1,9 +1,22 @@
 ## 未发布
 
+本版本基于 [Fomovet/clipkeep](https://github.com/Fomovet/clipkeep) 二次开发，由 [BevalZ/clipkeep](https://github.com/BevalZ/clipkeep) 发布，包含原生 Android、跨端图片互传及本 fork 的存储与可靠性改进。
+
 - 补齐上游 Windows 粘贴焦点与 Explorer 重命名、DIB 截图兼容、固定面板交互、热键唤醒、隐藏窗口内存和 WebView2 故障恢复。
 - 增加指向 BevalZ/clipkeep 的应用内更新、下载校验、托盘提示和安装自启维护。
 - 增加 HEX 色值预览、可选图片粘贴文件命名，并行首屏读取和托盘就绪显示；保留 Android、LAN、存储与虚拟列表优化。
+- 桌面增加精确内容匹配索引、事务内增量容量统计和列表索引，将列表及全文读取移出 UI 线程。Android 常规文本保存避免遍历图片目录，图片删除和保存失败后仍能清理无引用文件。
+- 桌面损坏数据库连同 WAL、原图和缩略图归档保留，未完成的恢复可续做；图片写入至入库完成期间受到保护。容量不足时回滚保存，避免误报成功；修复输入法快捷键和设置并发保存。
+- Android 图片分享 URI 绑定记录与内容，避免记录 ID 复用后访问到其他图片。
+- README 重写并在开头明确上游来源，补充平台差异、使用步骤和验证范围。
 - 改动与验证范围见 [上游移植记录](UPSTREAM_INTEGRATION.md)。
+
+### 升级说明
+
+- Windows 首次打开时将数据库迁移到 schema 4。建议先导出 `.ckbak` 备份；迁移后旧程序会拒绝打开新库，不能直接覆盖旧 exe 降级。本 fork 与原始仓库可能共用 `%APPDATA%\com.clipkeep.clipboard\`，切换前先正常退出旧实例。
+- Android 保持本 fork 既有正式签名，可覆盖同签名旧版本；升级前复制的旧式图片 URI 将失效，需要从历史重新复制或分享，原图不受影响。
+- 本轮不更改 LAN 协议；旧文本传输继续兼容，双方为 0.4.0+ 时可用分块。全文搜索仍采用原子串语义；数据库索引会占用额外空间，并增加批量写入成本。
+- CI 已覆盖 Windows Rust、前端、存储、浏览器模拟 IPC，以及 Android 构建、单元测试和 Lint。真实 Windows GUI/安装升级和多厂商 Android 后台行为仍需设备验证，Android 一项生命周期时序检查待复核。
 
 ## clipkeep v0.4.2
 
