@@ -32,8 +32,13 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 getrandom = "0.4.3"
 local-ip-address = "0.6.13"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "system-proxy"] }
+sha2 = "0.10.9"
+semver = "1"
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
+webview2-com = "0.39.1"
+windows-core = "0.62.2"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory"] }
 
 [target.'cfg(not(windows))'.dependencies]
 tauri-plugin-global-shortcut = "2.4.1"

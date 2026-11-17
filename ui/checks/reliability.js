@@ -14,6 +14,8 @@ async (page) => {
       mockIPC(async (cmd, args) => {
         const state = window.checkState;
         state.calls.push(cmd);
+        if (cmd === 'get_update_state') return {kind:'idle'};
+        if (cmd === 'get_rename_safe_mode') return false;
         if (cmd === 'plugin:window|is_visible') return true;
         if (cmd === 'list_clips') return [1,2].map(id => ({id,kind:'text',preview:'item '+id,
           size:6,truncated:false,favorite:false,pinned:false,updatedAt:Date.now(),source:null,groupId:null,thumb:null}));

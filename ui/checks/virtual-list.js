@@ -8,6 +8,8 @@ async (page) => {
       mockWindows('main');
       window.testCalls = 0;
       mockIPC(async (cmd, args) => {
+        if (cmd === 'get_update_state') return {kind:'idle'};
+        if (cmd === 'get_rename_safe_mode') return false;
         if (cmd === 'plugin:window|is_visible') return true;
         if (cmd === 'list_clips') { window.testCalls++; await new Promise(r => setTimeout(r, 40)); return Array.from({length: 1000}, (_, i) => ({id: i + 1, kind: 'text', preview: '记录 ' + (i + 1) + '\\n第二行内容\\n第三行内容', size: 100, truncated: true, favorite: false, pinned: false, updatedAt: Date.now(), source: null, groupId: null, thumb: null})); }
         if (cmd === 'list_groups') return [];

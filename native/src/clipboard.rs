@@ -5,7 +5,7 @@ use std::borrow::Cow;
 #[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(windows)]
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -15,12 +15,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
+use windows_sys::Win32::Foundation::GlobalFree;
+#[cfg(windows)]
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    RegisterClipboardFormatW,
+    CloseClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows_sys::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::DragQueryFileW;
 
@@ -35,6 +39,8 @@ fn should_record_text(text: &str) -> bool {
 /// but we allow extra headroom without risking false positives from later real copies.
 const SUPPRESS_TTL: Duration = Duration::from_secs(2);
 
+#[cfg(windows)]
+const CF_BITMAP: u32 = 2;
 #[cfg(windows)]
 const CF_DIB: u32 = 8;
 #[cfg(windows)]
@@ -253,6 +259,27 @@ impl OpenedClipboard {
         }
     }
 
+    /// Copies one clipboard format's bytes.
+    fn read(&self, format: u32) -> Option<Vec<u8>> {
+        unsafe {
+            let handle = GetClipboardData(format);
+            if handle.is_null() {
+                return None;
+            }
+            let len = GlobalSize(handle);
+            if len > MAX_PIXELS as usize * 4 + 4096 {
+                return None;
+            }
+            let ptr = GlobalLock(handle) as *const u8;
+            if ptr.is_null() {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+            GlobalUnlock(handle);
+            Some(bytes)
+        }
+    }
+
     fn size_of(&self, format: u32) -> usize {
         unsafe {
             let handle = GetClipboardData(format);
@@ -381,12 +408,73 @@ fn too_large() -> bool {
     false
 }
 
+/// Decodes the clipboard bitmap ourselves when arboard can't (see `dib`). DIBV5 first, since it
+/// may carry alpha; CF_DIB is what Windows synthesizes it from, or vice versa.
+#[cfg(windows)]
+fn read_dib_fallback() -> Option<Rgba> {
+    let cb = OpenedClipboard::open()?;
+    [CF_DIBV5, CF_DIB].into_iter().find_map(|format| unsafe {
+        if IsClipboardFormatAvailable(format) == 0 {
+            return None;
+        }
+        cb.read(format).and_then(|bytes| crate::dib::decode(&bytes))
+    })
+}
+
+/// Any picture on the clipboard, including bitmaps Windows synthesizes from CF_BITMAP.
+#[cfg(windows)]
+fn has_bitmap() -> bool {
+    unsafe {
+        let png = RegisterClipboardFormatW(wide("PNG").as_ptr());
+        [CF_DIBV5, CF_DIB, CF_BITMAP]
+            .into_iter()
+            .any(|format| IsClipboardFormatAvailable(format) != 0)
+            || (png != 0 && IsClipboardFormatAvailable(png) != 0)
+    }
+}
+
+/// The clipboard's formats, for the diagnostics log when a copy isn't recorded.
+#[cfg(windows)]
+fn format_names() -> String {
+    let Some(_cb) = OpenedClipboard::open() else {
+        return "<busy>".into();
+    };
+    let mut names = Vec::new();
+    let mut format = 0;
+    unsafe {
+        loop {
+            format = EnumClipboardFormats(format);
+            if format == 0 {
+                break;
+            }
+            let mut buf = [0u16; 128];
+            let len = GetClipboardFormatNameW(format, buf.as_mut_ptr(), buf.len() as i32);
+            names.push(if len > 0 {
+                String::from_utf16_lossy(&buf[..len as usize])
+            } else {
+                format.to_string()
+            });
+        }
+    }
+    names.join(",")
+}
+
 /// Retry delays for clipboard read operations (exponential backoff).
 /// Other clipboard listeners can briefly hold the clipboard open; we retry with increasing delays.
 const CLIPBOARD_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(15),
     Duration::from_millis(35),
     Duration::from_millis(75),
+];
+
+/// A large bitmap may be rendered only when asked for (screenshot tools, OLE data objects), and
+/// can keep the clipboard busy longer than text does: allow about a second.
+const IMAGE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(30),
+    Duration::from_millis(60),
+    Duration::from_millis(120),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
 ];
 
 /// Text wins when both exist (e.g. spreadsheet cells also carry a bitmap).
@@ -406,13 +494,23 @@ fn read_with_retry(retry_delays: &[Duration]) -> Option<Captured> {
                 return None;
             }
             match read_image_file_drop() {
+                // Our own paste of a picture also offers it as a file (see write_image).
+                ImageFileDrop::Paths(paths) if paths.iter().all(|p| is_paste_file(p)) => {
+                    return None;
+                }
                 ImageFileDrop::Paths(paths) => return Some(Captured::ImageFiles(paths)),
-                ImageFileDrop::Ignored => return None,
                 ImageFileDrop::Busy if attempt < retry_delays.len() => {
                     thread::sleep(retry_delays[attempt]);
                     continue;
                 }
-                ImageFileDrop::Busy => return None,
+                // Not image files, or unreadable: a picture copied alongside is still worth
+                // keeping, e.g. from a screenshot tool that also offers the saved file.
+                ImageFileDrop::Ignored | ImageFileDrop::Busy => {
+                    if !has_bitmap() {
+                        return None;
+                    }
+                    crate::win::log_diagnostic("clipboard-file-drop-skipped reading-bitmap");
+                }
             }
         }
         let mut cb = match arboard::Clipboard::new() {
@@ -434,7 +532,9 @@ fn read_with_retry(retry_delays: &[Duration]) -> Option<Captured> {
             Ok(text) if should_record_text(&text) => {
                 return Some(Captured::Text(text));
             }
-            Ok(_) => return None, // Empty or too large
+            // Blank text next to a picture: keep the picture.
+            Ok(text) if text.trim().is_empty() => {}
+            Ok(_) => return None, // Too large, or a pairing code
             Err(arboard::Error::ContentNotAvailable) => {
                 // No text, try image below
             }
@@ -454,30 +554,60 @@ fn read_with_retry(retry_delays: &[Duration]) -> Option<Captured> {
         if !CAPTURE_IMAGES.load(Ordering::Relaxed) {
             return None;
         }
+        drop(cb);
+        return read_image();
+    }
 
-        return match cb.get_image() {
+    None
+}
+
+/// Reads the clipboard picture. Whatever arboard can't deliver (a bitmap it fails to decode, a
+/// clipboard that stays busy, a bitmap it doesn't look for) goes to our own DIB decoder.
+fn read_image() -> Option<Captured> {
+    let mut last_error = String::new();
+    for attempt in 0..=IMAGE_RETRY_DELAYS.len() {
+        if is_excluded() || too_large() {
+            return None;
+        }
+        match arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) {
             Ok(img) if img.width as u64 * img.height as u64 <= MAX_PIXELS => {
-                Some(Captured::Image(Rgba {
+                return Some(Captured::Image(Rgba {
                     width: img.width as u32,
                     height: img.height as u32,
                     pixels: img.bytes.into_owned(),
-                }))
+                }));
             }
-            Ok(_) => None,
-            Err(e) => {
-                if attempt < retry_delays.len() {
-                    thread::sleep(retry_delays[attempt]);
-                    continue;
+            Ok(_) => return None,
+            // A decode failure won't go away on retry.
+            Err(arboard::Error::ConversionFailure) => {
+                last_error = "arboard could not decode the bitmap".into();
+                break;
+            }
+            Err(arboard::Error::ContentNotAvailable) => {
+                if !has_bitmap() {
+                    return None;
                 }
-                eprintln!(
-                    "clipboard image read failed after {} attempts: {}",
-                    max_attempts, e
-                );
-                None
+                last_error = "arboard found no PNG or CF_DIBV5".into();
+                break;
             }
-        };
+            Err(e) => {
+                last_error = e.to_string();
+                if let Some(delay) = IMAGE_RETRY_DELAYS.get(attempt) {
+                    thread::sleep(*delay);
+                }
+            }
+        }
     }
-
+    #[cfg(windows)]
+    if let Some(img) = read_dib_fallback() {
+        return Some(Captured::Image(img));
+    }
+    eprintln!("clipboard image not recorded: {last_error}");
+    #[cfg(windows)]
+    crate::win::log_diagnostic(&format!(
+        "clipboard-image-skipped reason=\"{last_error}\" formats=[{}]",
+        format_names()
+    ));
     None
 }
 
@@ -495,13 +625,82 @@ pub fn write_text(text: &str) -> Result<(), arboard::Error> {
 
 #[cfg(windows)]
 pub fn write_image(img: &Rgba) -> Result<(), arboard::Error> {
-    let hash = crate::images::hash(img);
-    suppress_writeback(hash);
+    write_named_image(img, None)
+}
+
+/// Where a pasted picture is also offered as a file.
+#[cfg(windows)]
+fn paste_dir() -> PathBuf {
+    std::env::temp_dir().join("clipkeep-bevalz-paste")
+}
+
+#[cfg(windows)]
+fn is_paste_file(path: &Path) -> bool {
+    path.starts_with(paste_dir())
+}
+
+/// `file` (PNG bytes, file name) also offers the picture as a file with that name. Browsers name
+/// every pasted bitmap "image.png", which upload forms reject as a duplicate on the next paste;
+/// for a file they use its own name.
+#[cfg(windows)]
+pub fn write_named_image(img: &Rgba, file: Option<(&[u8], &str)>) -> Result<(), arboard::Error> {
+    suppress_writeback(crate::images::hash(img));
+    let path = file.and_then(|(png, name)| match write_paste_file(png, name) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            eprintln!("could not write the paste file: {e}");
+            None
+        }
+    });
+    if let Some(path) = &path {
+        suppress_writeback(Captured::ImageFiles(vec![path.clone()]).content_hash());
+    }
     arboard::Clipboard::new()?.set_image(ImageData {
         width: img.width as usize,
         height: img.height as usize,
         bytes: Cow::Borrowed(&img.pixels),
-    })
+    })?;
+    if let Some(path) = path {
+        add_file_drop(&path);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_paste_file(png: &[u8], name: &str) -> std::io::Result<PathBuf> {
+    crate::paste_files::write(&paste_dir(), png, name)
+}
+
+/// Adds CF_HDROP for `path` next to the bitmap formats arboard just wrote.
+#[cfg(windows)]
+fn add_file_drop(path: &Path) {
+    // DROPFILES: offset of the file list, drop point, non-client flag, wide-character flag.
+    let mut data = Vec::with_capacity(20 + path.as_os_str().len() * 2 + 4);
+    for field in [20u32, 0, 0, 0, 1] {
+        data.extend_from_slice(&field.to_le_bytes());
+    }
+    for unit in path.as_os_str().encode_wide().chain([0, 0]) {
+        data.extend_from_slice(&unit.to_le_bytes());
+    }
+    let Some(_cb) = OpenedClipboard::open() else {
+        return;
+    };
+    unsafe {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, data.len());
+        if handle.is_null() {
+            return;
+        }
+        let ptr = GlobalLock(handle) as *mut u8;
+        if ptr.is_null() {
+            GlobalFree(handle);
+            return;
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        GlobalUnlock(handle);
+        if SetClipboardData(CF_HDROP, handle).is_null() {
+            GlobalFree(handle);
+        }
+    }
 }
 
 // X11 selections stay available only while the owner connection is alive.
@@ -546,6 +745,11 @@ fn is_excluded() -> bool {
 
 #[cfg(not(windows))]
 fn too_large() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn has_bitmap() -> bool {
     false
 }
 

@@ -5,8 +5,18 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, applyTheme, loadUi, saveUi, type Clip, type Group, type LanPeer, type Scope } from "./api";
 const SettingsView = defineAsyncComponent(() => import("./components/SettingsView.vue"));
+import { useUpdate } from "./update";
 import ClipIcon from "./components/ClipIcon.vue";
 
+const { newer: newerVersion } = useUpdate();
+const focusAbout = ref(false);
+const preserveExplorerRename = ref(false);
+const transferBusy = ref(false);
+let transferGeneration = 0;
+let pendingFocusError = "";
+let visibilityGeneration = 0;
+let groupGeneration = 0;
+let restoring = false;
 const page = ref<"list" | "settings">("list");
 const scope = ref<Scope>("all");
 const activeGroup = ref<number | null>(null);
@@ -115,7 +125,11 @@ async function reload(keepScroll = false) {
 }
 
 async function reloadGroups() {
-  groups.value = await api.listGroups();
+  const generation = ++groupGeneration;
+  const visibility = visibilityGeneration;
+  const rows = await api.listGroups();
+  if (!windowShown || visibility !== visibilityGeneration || generation !== groupGeneration) return;
+  groups.value = rows;
   if (scope.value === "group" && !groups.value.some((g) => g.id === activeGroup.value)) selectScope("all");
 }
 
@@ -127,7 +141,7 @@ function selectScope(s: Scope, groupId: number | null = null) {
 
 watch([scope, activeGroup], () => {
   selected.value = 0;
-  reload();
+  if (!restoring) void reload();
 });
 // Debounced so a full-text LIKE scan doesn't run on every keystroke.
 watch(query, () => {
@@ -136,8 +150,29 @@ watch(query, () => {
   searchTimer = window.setTimeout(reload, 180);
 });
 
-const paste = (c?: Clip) => c && api.pasteClip(c.id);
-const copyOnly = (c?: Clip) => c && api.copyClip(c.id);
+function reportFocusError(error: unknown) {
+  const message = String(error);
+  if (message === "操作已取消") return;
+  if (windowShown) flash(message);
+  else pendingFocusError = message;
+}
+
+async function transfer(c: Clip | undefined, paste: boolean) {
+  if (!c || transferBusy.value) return;
+  const generation = ++transferGeneration;
+  transferBusy.value = true;
+  try {
+    if (paste) await api.pasteClip(c.id);
+    else await api.copyClip(c.id);
+  } catch (error) {
+    if (generation === transferGeneration) reportFocusError(error);
+  } finally {
+    if (generation === transferGeneration) transferBusy.value = false;
+  }
+}
+
+const paste = (c?: Clip) => transfer(c, true);
+const copyOnly = (c?: Clip) => transfer(c, false);
 const remove = (c?: Clip) => c && api.deleteClip(c.id);
 const toggleFav = (c?: Clip) => c && api.toggleFavorite(c.id);
 const togglePin = (c?: Clip) => c && api.togglePinned(c.id);
@@ -632,6 +667,9 @@ function backToTop() {
 }
 
 function onHidden() {
+  ++visibilityGeneration;
+  ++groupGeneration;
+  preserveExplorerRename.value = false;
   if (windowShown && listEl.value) saveUi({ scrollTop: listEl.value.scrollTop });
   pendingReload = null;
   ++loadSeq; // A late IPC response must not repopulate a hidden window.
@@ -656,9 +694,9 @@ function onHidden() {
   window.clearTimeout(noticeTimer);
 }
 
-function hideWindow() {
-  onHidden();
-  void api.hideWindow();
+async function hideWindow() {
+  try { await api.hideWindow(); }
+  catch (error) { reportFocusError(error); }
 }
 
 function timeAgo(ms: number) {
@@ -681,13 +719,15 @@ function itemHint(c: Clip, index: number) {
   ].filter(Boolean).join(" · ");
 }
 
-function openSettings() {
+function openSettings(about = false) {
+  focusAbout.value = about;
   ++loadSeq;
   pendingReload = null;
   window.clearTimeout(searchTimer);
   page.value = "settings";
 }
 function backToList() {
+  focusAbout.value = false;
   page.value = "list";
   nextTick(() => {
     if (listEl.value) listEl.value.scrollTop = scrollTop.value;
@@ -696,27 +736,35 @@ function backToList() {
   });
 }
 
-async function onShown() {
-  page.value = "list";
-  query.value = "";
+async function onShown(renameSafeMode = false) {
   onHidden();
+  const generation = visibilityGeneration;
+  ++transferGeneration;
+  transferBusy.value = false;
   windowShown = true;
-  // Restore keyboard control before the database refresh finishes.
-  nextTick(() => searchEl.value?.focus());
+  preserveExplorerRename.value = renameSafeMode;
+  query.value = "";
+  if (pendingFocusError) { flash(pendingFocusError); pendingFocusError = ""; }
+  if (!renameSafeMode) nextTick(() => {
+    if (windowShown && generation === visibilityGeneration) searchEl.value?.focus();
+  });
   const ui = loadUi();
   restoreScroll = ui.scrollTop;
   selected.value = 0;
-  await reloadGroups();
-  // Restore the remembered tab, falling back to All if that group is gone.
-  if (ui.scope === "group" && groups.value.some((g) => g.id === ui.groupId)) {
-    scope.value = "group";
-    activeGroup.value = ui.groupId;
-  } else {
-    scope.value = ui.scope === "fav" ? "fav" : "all";
-    activeGroup.value = null;
+  // Restore the saved ID immediately. Fresh groups correct a deleted group below.
+  restoring = true;
+  scope.value = ui.scope;
+  activeGroup.value = ui.scope === "group" ? ui.groupId : null;
+  await nextTick();
+  restoring = false;
+  if (!windowShown || generation !== visibilityGeneration) return;
+  window.clearTimeout(searchTimer);
+  try {
+    const [, , isPaused] = await Promise.all([reloadGroups(), reload(), api.getCapturePaused()]);
+    if (windowShown && generation === visibilityGeneration) paused.value = isPaused;
+  } catch (error) {
+    if (windowShown && generation === visibilityGeneration) flash(`读取状态失败：${error}`);
   }
-  await reload();
-  paused.value = await api.getCapturePaused();
 }
 
 function preventNativeContextMenu(event: MouseEvent) {
@@ -730,13 +778,17 @@ onMounted(async () => {
   unlisteners.push(
     await listen("clips-changed", () => reload(true)),
     await listen("groups-changed", () => { if (windowShown) void reloadGroups(); }),
-    await listen("window-shown", onShown),
+    await listen<boolean>("window-shown", (e) => onShown(e.payload ?? false)),
+    await listen<boolean>("rename-safe-mode-changed", (e) => { preserveExplorerRename.value = e.payload; }),
+    await listen<string>("focus-error", (e) => reportFocusError(e.payload)),
+    await listen("open-about", () => openSettings(true)),
     await listen("window-hidden", onHidden),
     await listen("settings-changed", syncSettings),
     await listen<string>("lan-sync-error", (e) => { if (windowShown) flash(`自动发送失败：${e.payload}`); }),
     await listen<boolean>("capture-paused-changed", (e) => (paused.value = e.payload)),
   );
-  if (await getCurrentWindow().isVisible()) await onShown();
+  const [visible, rename] = await Promise.all([getCurrentWindow().isVisible(), api.getRenameSafeMode()]);
+  if (visible || rename) await onShown(rename);
   await syncSettings();
 });
 
@@ -760,7 +812,7 @@ onUnmounted(() => {
 
 <template>
   <div class="shell">
-    <SettingsView v-if="page === 'settings'" @back="backToList" />
+    <SettingsView :focus-about="focusAbout" v-if="page === 'settings'" @back="backToList" />
 
     <template v-else>
       <header class="topbar" @mousedown.self.left="startWindowDrag">
@@ -782,21 +834,23 @@ onUnmounted(() => {
           >
             <ClipIcon name="pin" />
           </button>
-          <button class="icon-btn" title="设置" @click="openSettings"><ClipIcon name="settings" /></button>
+          <button class="icon-btn settings-btn" title="设置" aria-label="设置" @click="openSettings()"><ClipIcon name="settings" /><span v-if="newerVersion" class="update-dot" aria-label="有新版本"></span></button>
           <button class="icon-btn" title="隐藏 (Esc)" @click="hideWindow"><ClipIcon name="close" /></button>
         </div>
       </header>
 
       <div class="search">
         <ClipIcon name="search" />
-        <input ref="searchEl" v-model="query" placeholder="搜索文本…" spellcheck="false" />
+        <input ref="searchEl" :disabled="preserveExplorerRename" v-model="query" placeholder="搜索文本…" spellcheck="false" />
         <button v-if="query" class="icon-btn clear" title="清除" @click="query = ''"><ClipIcon name="close" /></button>
       </div>
 
       <button v-if="paused" class="pause-banner" @click="api.toggleCapturePaused()">
         <ClipIcon name="pause" /> 记录已暂停 · 点击继续
       </button>
-      <div v-if="notice" class="notice-banner">{{ notice }}</div>
+      <div v-if="notice" class="notice-banner" role="status">{{ notice }}</div>
+      <div v-else-if="transferBusy" class="notice-banner" role="status">正在准备内容…</div>
+      <div v-else-if="preserveExplorerRename" class="notice-banner" role="status">资源管理器正在重命名，点击记录粘贴；键盘仍由资源管理器接收</div>
 
       <ul ref="listEl" class="list" @scroll="onScroll">
         <li v-if="startRow" aria-hidden="true" :style="{ height: `${startRow * ROW_HEIGHT}px` }"></li>
@@ -817,6 +871,7 @@ onUnmounted(() => {
               <span class="image-name" :title="c.source || '剪贴板图片'">{{ c.source || '剪贴板图片' }}</span>
               <span v-if="c.width && c.height" class="image-dimensions">{{ c.width }} × {{ c.height }}</span>
             </div>
+            <div v-else-if="c.color" class="hex-preview"><span class="hex-swatch"><span :style="{ background: c.color }"></span></span><code>{{ c.preview }}</code></div>
             <div v-else class="text">{{ c.preview }}<span v-if="c.truncated" class="more">…</span></div>
             <div class="item-footer">
               <div class="meta">
@@ -1416,4 +1471,11 @@ onUnmounted(() => {
   font-size: var(--fs-sm);
 }
 .preview-loading { color: var(--muted); }
+
+.settings-btn { position: relative; }
+.update-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #e5484d; }
+.settings-btn .update-dot { position: absolute; top: 5px; right: 5px; }
+.hex-preview { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.hex-swatch { width: 40px; height: 40px; flex: none; overflow: hidden; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0 / 10px 10px; }
+.hex-swatch > span { display: block; width: 100%; height: 100%; }
 </style>

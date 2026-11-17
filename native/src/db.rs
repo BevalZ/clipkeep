@@ -38,6 +38,7 @@ pub struct Clip {
     #[serde(skip)]
     pub file: Option<String>,
     pub thumb: Option<String>,
+    pub color: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +99,15 @@ pub fn text_hash(text: &str) -> String {
     hasher.update(b"text\0");
     hasher.update(text.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+/// The colour a text names when, apart from surrounding whitespace, it is nothing but one hex
+/// colour. Text that merely mentions a colour ("背景色是 #fff") is not one.
+pub fn hex_color(text: &str) -> Option<String> {
+    let color = text.trim();
+    let digits = color.strip_prefix('#')?;
+    (matches!(digits.len(), 3 | 4 | 6 | 8) && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| color.to_owned())
 }
 
 fn preview_of(kind: &str, content: &str) -> Option<String> {
@@ -533,6 +543,12 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
         let kind: String = r.get(1)?;
         let body: String = r.get(2)?;
         let is_image = kind == KIND_IMAGE;
+        let truncated = !is_image && r.get::<_, Option<bool>>(4)?.unwrap_or(false);
+        let color = if !is_image && !truncated {
+            hex_color(&body)
+        } else {
+            None
+        };
         let (preview, file) = if is_image {
             (String::new(), Some(body))
         } else {
@@ -544,7 +560,8 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
             file,
             kind,
             size: r.get(3)?,
-            truncated: !is_image && r.get::<_, Option<bool>>(4)?.unwrap_or(false),
+            truncated,
+            color,
             width: r.get(5)?,
             height: r.get(6)?,
             favorite: r.get::<_, i64>(7)? != 0,
@@ -557,6 +574,11 @@ pub fn list(conn: &Connection, scope: Scope, query: &str) -> rusqlite::Result<Ve
     };
     let rows = stmt.query_map(rusqlite::params_from_iter(args), map)?;
     rows.collect()
+}
+
+#[cfg(windows)]
+pub fn source(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT source FROM clips WHERE id=?1", [id], |r| r.get(0))
 }
 
 pub fn get(conn: &Connection, id: i64) -> rusqlite::Result<Option<(String, String)>> {
@@ -614,11 +636,18 @@ pub fn edit_text(
     .map_err(|e| e.to_string())
 }
 
-pub fn touch(conn: &Connection, id: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE clips SET updated_at = ?2, use_count = use_count + 1 WHERE id = ?1",
-        params![id, now_ms()],
-    )?;
+pub fn touch(conn: &Connection, id: i64, to_top: bool) -> rusqlite::Result<()> {
+    if to_top {
+        conn.execute(
+            "UPDATE clips SET updated_at = ?2, use_count = use_count + 1 WHERE id = ?1",
+            params![id, now_ms()],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE clips SET use_count = use_count + 1 WHERE id = ?1",
+            params![id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1061,6 +1090,69 @@ mod tests {
             r.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn recognises_only_a_single_complete_hex_colour() {
+        for (text, color) in [
+            ("#fff", "#fff"),
+            ("#AbCd", "#AbCd"),
+            ("#2563eb", "#2563eb"),
+            ("#AaBbCcDD", "#AaBbCcDD"),
+            (" \t#123456\r\n", "#123456"),
+            ("\u{3000}#123\u{3000}", "#123"),
+        ] {
+            assert_eq!(hex_color(text).as_deref(), Some(color), "{text:?}");
+        }
+        for text in [
+            "",
+            "#",
+            "#12",
+            "#12345",
+            "#1234567",
+            "#123456789",
+            "#12x",
+            "#ＦＦＦ",
+            "FFFFFF",
+            "0xFFFFFF",
+            "color: #fff",
+            "#fff #000",
+            "#fff\n#000",
+            "https://example.com/#fff",
+        ] {
+            assert_eq!(hex_color(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn using_an_item_moves_it_to_the_top_only_when_asked() {
+        let conn = mem();
+        let order = |conn: &Connection| -> Vec<i64> {
+            list(conn, Scope::All, "")
+                .unwrap()
+                .iter()
+                .map(|c| c.id)
+                .collect()
+        };
+        let oldest = add(&conn, "姓名", 6);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newest = add(&conn, "电话", 6);
+        assert_eq!(order(&conn), [newest, oldest]);
+
+        // Pinned window: pasting keeps the list still.
+        touch(&conn, oldest, false).unwrap();
+        assert_eq!(order(&conn), [newest, oldest]);
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        touch(&conn, oldest, true).unwrap();
+        assert_eq!(order(&conn), [oldest, newest]);
+
+        let uses: i64 = conn
+            .query_row("SELECT use_count FROM clips WHERE id = ?1", [oldest], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(uses, 3);
     }
 
     fn texts(conn: &Connection) -> Vec<String> {

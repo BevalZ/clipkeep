@@ -1,3 +1,10 @@
+## 未发布
+
+- 补齐上游 Windows 粘贴焦点与 Explorer 重命名、DIB 截图兼容、固定面板交互、热键唤醒、隐藏窗口内存和 WebView2 故障恢复。
+- 增加指向 BevalZ/clipkeep 的应用内更新、下载校验、托盘提示和安装自启维护。
+- 增加 HEX 色值预览、可选图片粘贴文件命名，并行首屏读取和托盘就绪显示；保留 Android、LAN、存储与虚拟列表优化。
+- 改动与验证范围见 [上游移植记录](UPSTREAM_INTEGRATION.md)。
+
 ## clipkeep v0.4.2
 
 - Windows 与 Android 默认在启动时清理旧重复项，保存 / 接收时合并当前同内容；Windows 还支持导入和编辑合并。保留收藏 / 置顶等状态，Windows 分组取最近有分组记录的分组。文本按全文精确比较，空格与大小写不忽略；图片沿用 Windows 像素哈希、Android PNG 字节哈希规则，相同图片文件仍保留引用。

@@ -15,3 +15,9 @@ mod lan_wire;
 mod lan_address;
 #[path = "../../src/recovery.rs"]
 mod recovery;
+
+#[path = "../../src/dib.rs"]
+mod dib;
+
+#[path = "../../src/paste_files.rs"]
+mod paste_files;

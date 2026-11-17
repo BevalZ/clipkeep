@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface Clip {
@@ -14,6 +15,7 @@ export interface Clip {
   source: string | null;
   groupId: number | null;
   thumb: string | null;
+  color: string | null;
 }
 
 export interface Group {
@@ -32,6 +34,8 @@ export interface Settings {
   windowY: number | null;
   maxStorageMb: number;
   theme: Theme;
+  checkUpdateOnStart: boolean;
+  pasteImageAsFile: boolean;
 }
 
 export type Theme = "system" | "light" | "dark";
@@ -102,6 +106,7 @@ export const api = {
   pasteClip: (id: number) => invoke<void>("paste_clip", { id }),
   copyClip: (id: number) => invoke<void>("copy_clip", { id }),
   hideWindow: () => invoke<void>("hide_window"),
+  getRenameSafeMode: () => invoke<boolean>("get_rename_safe_mode"),
   startDrag: () => invoke<void>("start_drag"),
   toggleKeepOnBlur: () => invoke<boolean>("toggle_keep_on_blur"),
   getAutostart: () => invoke<boolean>("get_autostart"),
@@ -114,7 +119,28 @@ export const api = {
   updateSettings,
   exportData: () => invoke<string | null>("export_data"),
   importData: () => invoke<string | null>("import_data"),
+  // In the browser, never inside our WebView: following a link there replaces the app's page.
+  openReleasePage: () => invoke<void>("open_release_page"),
+  // Checking, downloading and installing run in the backend and report through `update-state`.
+  getUpdateState: () => invoke<UpdateState>("get_update_state"),
+  checkUpdate: () => invoke<void>("check_update"),
+  downloadUpdate: () => invoke<void>("download_update"),
+  cancelUpdate: () => invoke<void>("cancel_update"),
+  installUpdate: () => invoke<void>("install_update"),
+
 };
+
+export { getVersion };
+
+/** Mirrors `update::State` in the backend. */
+export type UpdateState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "upToDate" }
+  | { kind: "available"; version: string; size: number; portable: boolean }
+  | { kind: "downloading"; version: string; received: number; total: number }
+  | { kind: "ready"; version: string }
+  | { kind: "error"; message: string; version: string | null };
 
 // The chosen theme is cached so the next window paints in it before settings load.
 const THEME_KEY = "clipkeep.theme";

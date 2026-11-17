@@ -2,12 +2,21 @@ mod atomic_file;
 mod backup;
 mod clipboard;
 mod db;
+#[cfg(any(windows, test))]
+mod dib;
+#[cfg(windows)]
+mod focus;
 mod images;
 mod lan;
 mod lan_address;
 mod lan_wire;
+#[cfg(any(windows, test))]
+mod paste_files;
+#[cfg(windows)]
+mod recover;
 mod recovery;
 mod settings;
+mod update;
 #[cfg(windows)]
 mod win;
 #[cfg(not(windows))]
@@ -27,9 +36,12 @@ use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(any(windows, test))]
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 #[cfg(windows)]
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -42,6 +54,8 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 const AUTOSTART_ARG: &str = "--minimized";
 #[cfg(windows)]
 const AUTOSTART_TASK: &str = "\\clipkeep-clipboard";
+#[cfg(windows)]
+const AUTOSTART_MARKER: &str = "autostart.pending";
 const BUNDLE_VERSION: u32 = 1;
 const MAX_IMPORT_FILE: u64 = 2 * 1024 * 1024 * 1024;
 /// Window won't auto-hide on blur until this epoch-ms (briefly after show or while dragging).
@@ -57,6 +71,12 @@ static FOCUS_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// goes through show_main/hide_main, so this flag is the authoritative toggle state.
 static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// Ignore a transient blur while WebView2 is being shown, then check real focus.
+#[cfg(windows)]
+static NOACTIVATE_VISIBLE: AtomicBool = AtomicBool::new(false);
+static PRESERVE_EDITOR_MODE: AtomicBool = AtomicBool::new(false);
+static TRAY_MENU_CREATING: AtomicBool = AtomicBool::new(false);
+static TRAY_MENU_READY: AtomicBool = AtomicBool::new(false);
+static TRAY_MENU_POINTER: Mutex<Option<PhysicalPosition<f64>>> = Mutex::new(None);
 static TRAY_MENU_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TRAY_MENU_EPOCH: AtomicU64 = AtomicU64::new(0);
 static TRAY_MENU_BLUR_GRACE_UNTIL: AtomicI64 = AtomicI64::new(0);
@@ -172,6 +192,17 @@ fn changed(app: &AppHandle) {
     let _ = app.emit("clips-changed", ());
 }
 
+// One waiting capture bounds raw-image memory; saving remains ordered and separate from reads.
+fn start_capture_worker(app: AppHandle) -> std::sync::mpsc::SyncSender<Captured> {
+    let (queue, captures) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        for captured in captures {
+            on_local_copy(&app, captured);
+        }
+    });
+    queue
+}
+
 fn on_local_copy(app: &AppHandle, captured: Captured) {
     if clipboard::capture_paused() {
         return;
@@ -182,6 +213,13 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
             .save_text(&text, None)
             .map(|()| core.lan.queue_local(app, db::text_hash(&text))),
         Captured::Image(img) => {
+            let _work = match images::IMAGE_WORK.lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!("image worker lock failed: {error}");
+                    return;
+                }
+            };
             let hash = images::hash(&img);
             core.images
                 .write(&img, &hash)
@@ -190,42 +228,36 @@ fn on_local_copy(app: &AppHandle, captured: Captured) {
         }
         #[cfg(windows)]
         Captured::ImageFiles(paths) => {
-            // A file selection can contain several large JPEGs. Keep decoding and PNG
-            // thumbnail generation off the clipboard listener so later copies aren't missed.
-            let app = app.clone();
-            std::thread::spawn(move || {
-                let core = app.state::<Core>();
-                let mut saved_any = false;
-                for path in paths {
-                    if clipboard::capture_paused() {
+            let mut saved_any = false;
+            for path in paths {
+                if clipboard::capture_paused() {
+                    break;
+                }
+                let _work = match images::IMAGE_WORK.lock() {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        eprintln!("image worker lock failed: {error}");
                         break;
                     }
-                    let _work = match images::IMAGE_WORK.lock() {
-                        Ok(guard) => guard,
-                        Err(error) => {
-                            eprintln!("image worker lock failed: {error}");
-                            break;
-                        }
-                    };
-                    let result = images::decode_file(&path).and_then(|img| {
-                        let hash = images::hash(&img);
-                        let source = path.file_name().map(|name| name.to_string_lossy());
-                        core.images
-                            .write(&img, &hash)
-                            .and_then(|saved| core.save_image(&saved, source.as_deref()))
-                            .map(|()| core.lan.queue_local(&app, hash))
-                    });
-                    match result {
-                        Ok(()) => saved_any = true,
-                        Err(e) => {
-                            eprintln!("save copied image file {} failed: {e}", path.display())
-                        }
+                };
+                let result = images::decode_file(&path).and_then(|img| {
+                    let hash = images::hash(&img);
+                    let source = path.file_name().map(|name| name.to_string_lossy());
+                    core.images
+                        .write(&img, &hash)
+                        .and_then(|saved| core.save_image(&saved, source.as_deref()))
+                        .map(|()| core.lan.queue_local(app, hash))
+                });
+                match result {
+                    Ok(()) => saved_any = true,
+                    Err(error) => {
+                        eprintln!("save copied image file {} failed: {error}", path.display())
                     }
                 }
-                if saved_any {
-                    changed(&app);
-                }
-            });
+            }
+            if saved_any {
+                changed(app);
+            }
             return;
         }
     };
@@ -485,6 +517,7 @@ fn reorder_groups(app: AppHandle, core: State<Core>, ids: Vec<i64>) -> CmdResult
 
 /// Reads the stored item and puts it on the clipboard. Image decoding happens before the lock is
 /// taken so a large image never blocks other DB users.
+#[cfg(not(windows))]
 fn put_on_clipboard(core: &Core, id: i64) -> CmdResult<()> {
     let (kind, content) = db::get(&*core.conn()?, id)
         .map_err(to_err)?
@@ -496,10 +529,11 @@ fn put_on_clipboard(core: &Core, id: i64) -> CmdResult<()> {
     } else {
         clipboard::write_text(&content).map_err(to_err)?;
     }
-    db::touch(&*core.conn()?, id).map_err(to_err)?;
+    db::touch(&*core.conn()?, id, !core.settings().keep_on_blur).map_err(to_err)?;
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tauri::command]
 fn paste_clip(app: AppHandle, id: i64) {
     hide_main(&app);
@@ -516,6 +550,7 @@ fn paste_clip(app: AppHandle, id: i64) {
     });
 }
 
+#[cfg(not(windows))]
 #[tauri::command]
 fn copy_clip(app: AppHandle, id: i64) {
     hide_main(&app);
@@ -528,9 +563,234 @@ fn copy_clip(app: AppHandle, id: i64) {
     });
 }
 
+#[cfg(not(windows))]
 #[tauri::command]
 fn hide_window(app: AppHandle) {
     hide_main(&app);
+}
+
+#[cfg(windows)]
+fn put_on_clipboard(core: &Core, id: i64, to_top: bool, action: focus::Action) -> CmdResult<()> {
+    let (kind, content) = db::get(&*core.conn()?, id)
+        .map_err(to_err)?
+        .ok_or("条目不存在")?;
+    if kind == db::KIND_IMAGE {
+        let _work = images::IMAGE_WORK.lock().map_err(to_err)?;
+        let img = core.images.load(&content)?;
+        let file = if core.settings().paste_image_as_file {
+            let source = db::source(&*core.conn()?, id).ok().flatten();
+            core.images
+                .png_bytes_limited(&content, 16 * 1024 * 1024)
+                .ok()
+                .map(|png| (png, paste_file_name(source.as_deref())))
+        } else {
+            None
+        };
+        if !focus::current(action) {
+            return Err(focus::CANCELLED.into());
+        }
+        clipboard::write_named_image(
+            &img,
+            file.as_ref()
+                .map(|(png, name)| (png.as_slice(), name.as_str())),
+        )
+        .map_err(to_err)?;
+    } else {
+        if !focus::current(action) {
+            return Err(focus::CANCELLED.into());
+        }
+        clipboard::write_text(&content).map_err(to_err)?;
+    }
+    db::touch(&*core.conn()?, id, to_top).map_err(to_err)?;
+    Ok(())
+}
+
+/// File name offered for a pasted picture: the original name of a copied image file, otherwise
+/// the time of the paste, so consecutive pastes into an upload form don't clash.
+#[cfg(any(windows, test))]
+fn paste_file_name(source: Option<&str>) -> String {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let stem = source
+        .and_then(|s| Path::new(s).file_stem())
+        .map(|stem| {
+            stem.to_string_lossy()
+                .chars()
+                .filter(|c| !c.is_control() && !r#"<>:"/\|?*"#.contains(*c))
+                .take(80)
+                .collect::<String>()
+                .trim()
+                .trim_end_matches('.')
+                .to_owned()
+        })
+        .filter(|stem| {
+            let upper = stem.to_ascii_uppercase();
+            !stem.is_empty()
+                && !RESERVED.contains(&upper.as_str())
+                && !((upper.starts_with("COM") || upper.starts_with("LPT")) && upper.len() == 4)
+        });
+    let stem = stem.unwrap_or_else(|| {
+        format!(
+            "clipkeep_{}_{}",
+            chrono_stamp(),
+            db::now_ms().rem_euclid(1000)
+        )
+    });
+    format!("{stem}.png")
+}
+
+/// Worker thread: keep image work and the bounded focus/modifier wait off the UI thread.
+#[cfg(windows)]
+fn return_to_input(
+    app: &AppHandle,
+    action: focus::Action,
+    paste: bool,
+    keep_open: bool,
+) -> CmdResult<()> {
+    // Ignore foreground transitions caused by restoring focus and injecting this paste.
+    let _returning = focus::Returning::new();
+    // A pinned panel stays visible after every paste. Explorer's rename mode is nonfocusable, so
+    // preserving that editor does not require hiding the pinned panel.
+    let hide_after = !keep_open;
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if !focus::current(action) {
+            let _ = send.send(Err(focus::CANCELLED.into()));
+            return;
+        }
+        let restored = focus::restore(action);
+        // A failed paste remains actionable if we still own the popup. Dismissals must
+        // always close, including when the old application has already exited.
+        if hide_after && (restored.is_ok() || !paste || !focus::owns_foreground()) {
+            hide_main_window(&handle);
+        }
+        let _ = send.send(restored);
+    })
+    .map_err(to_err)?;
+    recv.recv().map_err(to_err)??;
+    focus::wait_ready(action, paste).inspect_err(|error| {
+        win::log_diagnostic(&format!(
+            "restore-focus-failed {error} {}",
+            focus::diagnostic(action)
+        ));
+    })?;
+    if paste {
+        // Recheck immediately before injecting; another popup or external click invalidates it.
+        if !focus::target_focused(action)? {
+            return Err("原输入框已失去焦点，内容已复制，请手动粘贴".into());
+        }
+        if !win::send_paste() {
+            return Err("无法发送粘贴按键，内容已复制，请手动粘贴".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn transfer_clip(app: AppHandle, id: i64, paste: bool) -> CmdResult<()> {
+    let pinned = app
+        .try_state::<Core>()
+        .is_some_and(|core| core.settings().keep_on_blur);
+    let action = focus::claim()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            if !focus::current(action) {
+                return Err(focus::CANCELLED.into());
+            }
+            put_on_clipboard(&app.state::<Core>(), id, !pinned, action)?;
+            changed(&app);
+            // A pinned copy-only action leaves a normally focused panel ready for another choice.
+            if !paste && pinned && !focus::preserves_editor(action) {
+                return Ok(());
+            }
+            return_to_input(&app, action, paste, pinned)
+        })();
+        focus::finish(action);
+        result
+    })
+    .await
+    .map_err(to_err)?
+}
+
+#[tauri::command]
+#[cfg(windows)]
+async fn paste_clip(app: AppHandle, id: i64) -> CmdResult<()> {
+    transfer_clip(app, id, true).await
+}
+
+#[tauri::command]
+#[cfg(windows)]
+async fn copy_clip(app: AppHandle, id: i64) -> CmdResult<()> {
+    transfer_clip(app, id, false).await
+}
+
+#[tauri::command]
+#[cfg(windows)]
+async fn hide_window(app: AppHandle) -> CmdResult<()> {
+    let action = focus::dismiss()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = return_to_input(&app, action, false, false);
+        focus::finish(action);
+        result
+    })
+    .await
+    .map_err(to_err)?
+}
+#[tauri::command]
+fn get_rename_safe_mode() -> bool {
+    PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
+}
+
+/// Opens the download page in the user's browser. A link inside the WebView would navigate the
+/// app's own window away; going through Explorer also keeps the browser out of our elevation.
+#[tauri::command]
+fn open_release_page() -> CmdResult<()> {
+    #[cfg(windows)]
+    let opener = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let opener = "xdg-open";
+    Command::new(opener)
+        .arg(update::RELEASES_PAGE)
+        .spawn()
+        .map(drop)
+        .map_err(to_err)
+}
+
+#[tauri::command]
+fn get_update_state() -> update::State {
+    update::state()
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) {
+    update::check(&app, false).await;
+}
+
+#[tauri::command]
+fn download_update(app: AppHandle) {
+    tauri::async_runtime::spawn(update::download(app));
+}
+
+#[tauri::command]
+fn cancel_update() {
+    update::cancel();
+}
+
+/// The installer closes clipkeep itself; exiting right away just makes that immediate.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(update::install)
+        .await
+        .map_err(to_err)??;
+    if let Some(core) = app.try_state::<Core>() {
+        core.persist_position();
+    }
+    #[cfg(windows)]
+    recover::quitting();
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -579,32 +839,142 @@ fn autostart_task_exists() -> bool {
 }
 
 #[cfg(windows)]
+fn schtasks_error(output: &Output) -> String {
+    win::oem_to_string(&output.stderr).trim().to_owned()
+}
+
+#[cfg(any(windows, test))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Stored in the task's description; bump it when the definition changes so older tasks get
+/// rewritten on startup.
+#[cfg(any(windows, test))]
+const AUTOSTART_TASK_VERSION: &str = "clipkeep-autostart-v2";
+
+/// `schtasks /SC ONLOGON` gets several defaults wrong for a resident app: it fires on any user's
+/// logon, won't start on battery, stops when unplugged, kills the process after 72 hours and runs
+/// it at below-normal priority. Spell every one of them out.
+#[cfg(any(windows, test))]
+fn autostart_task_xml(executable: &str, user: &str) -> String {
+    let (exe, user) = (xml_escape(executable), xml_escape(user));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{AUTOSTART_TASK_VERSION}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>{AUTOSTART_ARG}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+#[cfg(windows)]
 fn create_autostart_task() -> CmdResult<()> {
     if cfg!(debug_assertions) {
         return Err("请使用发布版设置开机自启".into());
     }
     let executable = std::env::current_exe().map_err(to_err)?;
-    let task_run = format!("\"{}\" {AUTOSTART_ARG}", executable.display());
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
+        (_, Ok(name)) => name,
+        _ => return Err("创建开机自启任务失败：无法确定当前用户".into()),
+    };
+    let xml = autostart_task_xml(&executable.display().to_string(), &user);
+    // schtasks reads the definition from a file, as UTF-16 to match the declaration.
+    let path = std::env::temp_dir().join(format!("clipkeep-autostart-{}.xml", std::process::id()));
+    let bytes: Vec<u8> = [0xFEFFu16]
+        .into_iter()
+        .chain(xml.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    std::fs::write(&path, bytes).map_err(to_err)?;
     let output = run_schtasks(&[
         "/Create",
-        "/SC",
-        "ONLOGON",
         "/TN",
         AUTOSTART_TASK,
-        "/TR",
-        &task_run,
-        "/RL",
-        "HIGHEST",
-        "/IT",
+        "/XML",
+        &path.display().to_string(),
         "/F",
-    ])?;
+    ]);
+    let _ = std::fs::remove_file(&path);
+    let output = output?;
     if !output.status.success() {
-        return Err(format!(
-            "创建开机自启任务失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err(format!("创建开机自启任务失败：{}", schtasks_error(&output)));
     }
     Ok(())
+}
+
+/// Upgrade this executable's task or repair a missing executable. Other installed copies
+/// remain untouched until the user explicitly enables autostart from this one.
+#[cfg(windows)]
+fn upgrade_autostart_task() {
+    let Ok(output) = run_schtasks(&["/Query", "/TN", AUTOSTART_TASK, "/XML"]) else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let task = win::oem_to_string(&output.stdout);
+    let Some(target) = task_command(&task) else {
+        return;
+    };
+    let stale = if std::env::current_exe().is_ok_and(|exe| exe == target) {
+        !task.contains(AUTOSTART_TASK_VERSION)
+    } else {
+        !target.exists() // Preserve another installed copy until an explicit self-start change.
+    };
+    if stale && let Err(e) = create_autostart_task() {
+        eprintln!("upgrading autostart task failed: {e}");
+    }
+}
+
+/// The program a scheduled task starts, from its XML definition.
+#[cfg(any(windows, test))]
+fn task_command(xml: &str) -> Option<PathBuf> {
+    let start = xml.find("<Command>")? + "<Command>".len();
+    let end = start + xml[start..].find("</Command>")?;
+    let command = xml[start..end]
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    Some(PathBuf::from(command.trim().trim_matches('"')))
 }
 
 #[cfg(windows)]
@@ -612,10 +982,7 @@ fn delete_autostart_task() -> CmdResult<()> {
     if autostart_task_exists() {
         let output = run_schtasks(&["/Delete", "/TN", AUTOSTART_TASK, "/F"])?;
         if !output.status.success() {
-            return Err(format!(
-                "删除开机自启任务失败：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            return Err(format!("删除开机自启任务失败：{}", schtasks_error(&output)));
         }
     }
     Ok(())
@@ -889,7 +1256,7 @@ async fn import_data(app: AppHandle) -> CmdResult<Option<String>> {
     Ok(Some(format!("已导入 {imported} 条")))
 }
 
-/// Local time as YYYYMMDD-HHMMSS, for default export file names.
+/// UTC time as YYYYMMDD-HHMMSS, for default export file names.
 fn chrono_stamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -928,8 +1295,32 @@ fn hide_tray_menu_window(app: &AppHandle) {
         return;
     }
     TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
-    if let Some(window) = tray_menu_window(app) {
-        let _ = window.destroy();
+    // A menu still loading is destroyed by tray_menu_ready once it notices it isn't wanted.
+    if TRAY_MENU_READY.load(Ordering::Relaxed)
+        && let Some(window) = tray_menu_window(app)
+    {
+        destroy_tray_menu(&window);
+    }
+}
+
+fn destroy_tray_menu(window: &WebviewWindow) {
+    TRAY_MENU_READY.store(false, Ordering::Relaxed);
+    if let Err(e) = window.destroy() {
+        win::log_diagnostic(&format!("destroy-tray-menu-failed {e}"));
+    }
+}
+
+/// The page has rendered its state: show the menu if it is still wanted.
+#[tauri::command]
+fn tray_menu_ready(app: AppHandle) {
+    TRAY_MENU_READY.store(true, Ordering::Relaxed);
+    let Some(window) = tray_menu_window(&app) else {
+        return;
+    };
+    if TRAY_MENU_VISIBLE.load(Ordering::Relaxed) {
+        reveal_tray_menu(&app, &window);
+    } else {
+        destroy_tray_menu(&window);
     }
 }
 
@@ -948,35 +1339,65 @@ fn popup_axis(pointer: i32, extent: i32, start: i32, end: i32) -> i32 {
 }
 
 fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
-    let window = match tray_menu_window(app) {
-        Some(window) => window,
-        None => {
-            let Some(config) = app
-                .config()
-                .app
-                .windows
-                .iter()
-                .find(|w| w.label == "tray_menu")
-            else {
-                return;
-            };
-            match tauri::WebviewWindowBuilder::from_config(app, config)
-                .and_then(|builder| builder.build())
+    #[cfg(windows)]
+    focus::begin_session();
+    let pointer = app.cursor_position().unwrap_or(cursor);
+    if let Ok(mut slot) = TRAY_MENU_POINTER.lock() {
+        *slot = Some(pointer);
+    }
+    TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
+    TRAY_MENU_VISIBLE.store(true, Ordering::Relaxed);
+    if let Some(window) = tray_menu_window(app) {
+        // Still loading: tray_menu_ready reveals it at the latest pointer.
+        if TRAY_MENU_READY.load(Ordering::Relaxed) {
+            reveal_tray_menu(app, &window);
+        }
+        return;
+    }
+    if TRAY_MENU_CREATING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Building a WebView on the event-loop thread can deadlock on Windows while it waits for
+    // WebView2, so build elsewhere and let the builder hand the work to the main thread.
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let built = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|config| config.label == "tray_menu")
+            .ok_or_else(|| "tray menu window is not configured".to_string())
+            .and_then(|config| {
+                tauri::WebviewWindowBuilder::from_config(&app, config)
+                    .and_then(|builder| builder.build())
+                    .map_err(to_err)
+            });
+        TRAY_MENU_CREATING.store(false, Ordering::Relaxed);
+        match built {
+            Ok(_window) =>
             {
-                Ok(window) => window,
-                Err(error) => {
-                    eprintln!("create tray menu failed: {error}");
-                    return;
+                #[cfg(windows)]
+                if let Ok(hwnd) = _window.hwnd() {
+                    win::disable_transitions(hwnd.0 as _);
                 }
             }
+            Err(e) => {
+                TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
+                win::log_diagnostic(&format!("create-tray-menu-failed {e}"));
+            }
         }
-    };
-    TRAY_MENU_EPOCH.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+fn reveal_tray_menu(app: &AppHandle, window: &WebviewWindow) {
     TRAY_MENU_BLUR_GRACE_UNTIL.store(db::now_ms() + 120, Ordering::Relaxed);
     let Ok(size) = window.outer_size() else {
         return;
     };
-    let pointer = app.cursor_position().unwrap_or(cursor);
+    let Some(pointer) = TRAY_MENU_POINTER.lock().ok().and_then(|slot| *slot) else {
+        return;
+    };
     let mut x = pointer.x.round() as i32 + 6;
     let mut y = pointer.y.round() as i32 + 6;
     if let Ok(Some(monitor)) = app.monitor_from_point(pointer.x, pointer.y) {
@@ -989,12 +1410,11 @@ fn show_tray_menu(app: &AppHandle, cursor: PhysicalPosition<f64>) {
         y = popup_axis(pointer.y.round() as i32, size.height as i32, top, bottom);
     }
     let _ = window.set_position(PhysicalPosition::new(x, y));
-    // Windows can restore the native caption while this secondary window is
-    // hidden. Enforce the borderless style immediately before every show.
+    // Windows can restore the native caption on this secondary window. Enforce the borderless
+    // style immediately before every show.
     if let Err(e) = window.set_decorations(false) {
         win::log_diagnostic(&format!("style-tray-menu-failed {e}"));
     }
-    TRAY_MENU_VISIBLE.store(true, Ordering::Relaxed);
     if let Err(e) = window.show() {
         TRAY_MENU_VISIBLE.store(false, Ordering::Relaxed);
         win::log_diagnostic(&format!("show-tray-menu-failed {e}"));
@@ -1018,7 +1438,12 @@ mod popup_position_tests {
 }
 
 fn on_tray_menu_focus_changed(app: &AppHandle, focused: bool) {
-    if focused || !TRAY_MENU_VISIBLE.load(Ordering::Relaxed) {
+    // A freshly built window reports a blur while its page is still loading, before it was ever
+    // shown; that must not cancel the menu the user just asked for.
+    if focused
+        || !TRAY_MENU_VISIBLE.load(Ordering::Relaxed)
+        || !TRAY_MENU_READY.load(Ordering::Relaxed)
+    {
         return;
     }
     let epoch = TRAY_MENU_EPOCH.load(Ordering::Relaxed);
@@ -1064,13 +1489,24 @@ fn tray_menu_action(app: AppHandle, action: String) -> CmdResult<()> {
             if let Some(core) = app.try_state::<Core>() {
                 core.persist_position();
             }
+            #[cfg(windows)]
+            recover::quitting();
             app.exit(0);
+        }
+        // A newer version is known: downloading and installing are confirmed in Settings.
+        "update" => {
+            hide_tray_menu_window(&app);
+            show_main(&app);
+            if let Some(w) = main_window(&app) {
+                let _ = w.emit("open-about", ());
+            }
         }
         _ => return Err("未知的托盘操作".into()),
     }
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn hide_main(app: &AppHandle) {
     win::log_diagnostic("hide-main");
     FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -1089,6 +1525,7 @@ fn hide_main(app: &AppHandle) {
     }
 }
 
+#[cfg(not(windows))]
 fn show_main(app: &AppHandle) {
     win::log_diagnostic("show-main-begin");
     hide_tray_menu_window(app);
@@ -1098,8 +1535,7 @@ fn show_main(app: &AppHandle) {
         win::log_diagnostic("show-main-no-window");
         return;
     };
-    #[cfg(windows)]
-    win::remember_foreground();
+
     #[cfg(target_os = "macos")]
     let _ = app.show();
     place_window(app, &w);
@@ -1127,11 +1563,215 @@ fn show_main(app: &AppHandle) {
     let _ = w.emit("window-shown", ());
 }
 
+#[cfg(not(windows))]
 fn toggle_main(app: &AppHandle) {
     let visible = WINDOW_VISIBLE.load(Ordering::Relaxed);
     win::log_diagnostic(&format!("toggle-main visible={}", visible));
     if visible {
         hide_main(app);
+    } else {
+        show_main(app);
+    }
+}
+
+#[cfg(windows)]
+fn set_low_memory(window: &WebviewWindow, low: bool) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        ICoreWebView2_19,
+    };
+    use windows_core::Interface;
+
+    let level = if low {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+    } else {
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+    };
+    let _ = window.with_webview(move |webview| unsafe {
+        // ICoreWebView2_19 needs WebView2 Runtime 114+; older runtimes simply keep the default.
+        if let Ok(core) = webview.controller().CoreWebView2()
+            && let Ok(core) = core.cast::<ICoreWebView2_19>()
+            && let Err(e) = core.SetMemoryUsageTargetLevel(level)
+        {
+            win::log_diagnostic(&format!("set-memory-level-failed {e}"));
+        }
+    });
+}
+
+#[cfg(windows)]
+fn hide_main(app: &AppHandle) {
+    focus::cancel();
+    hide_main_window(app);
+}
+
+/// Native close/toggle callbacks cannot await IPC; report the same failure through an event.
+#[cfg(windows)]
+fn dismiss_main(app: &AppHandle) {
+    let Ok(action) = focus::dismiss() else {
+        hide_main(app);
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = return_to_input(&app, action, false, false);
+        focus::finish(action);
+        if let Err(error) = result
+            && error != focus::CANCELLED
+        {
+            let _ = app.emit("focus-error", error);
+        }
+    });
+}
+
+#[cfg(windows)]
+fn hide_main_window(app: &AppHandle) {
+    win::log_diagnostic("hide-main");
+    FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
+    DRAG_HIDE_UNTIL.store(0, Ordering::Relaxed);
+    WINDOW_VISIBLE.store(false, Ordering::Relaxed);
+    let no_activate = NOACTIVATE_VISIBLE.swap(false, Ordering::Relaxed);
+    PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+    if let Some(w) = main_window(app) {
+        let _ = w.emit("window-hidden", ());
+        let hide_result = if no_activate {
+            w.hwnd()
+                .map(|hwnd| win::hide_no_activate(hwnd.0 as _))
+                .map_err(to_err)
+        } else {
+            w.hide().map_err(to_err)
+        };
+        if let Err(e) = hide_result {
+            win::log_diagnostic(&format!("hide-main-failed {e}"));
+        }
+        set_low_memory(&w, true);
+    }
+    if let Some(core) = app.try_state::<Core>() {
+        core.persist_position();
+    }
+}
+
+#[cfg(windows)]
+fn show_main(app: &AppHandle) {
+    if recover::blocks_show(app) {
+        return;
+    }
+    win::log_diagnostic("show-main-begin");
+    let preserve_editor = focus::begin_session();
+    hide_tray_menu_window(app);
+    FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed);
+    DRAG_HIDE_UNTIL.store(0, Ordering::Relaxed);
+    let Some(w) = main_window(app) else {
+        win::log_diagnostic("show-main-no-window");
+        return;
+    };
+    set_low_memory(&w, false);
+    place_window(app, &w);
+    // Showing and focusing the WebView can emit a transient blur event.
+    SUPPRESS_HIDE_UNTIL.store(db::now_ms() + SHOW_BLUR_GRACE_MS, Ordering::Relaxed);
+    if preserve_editor {
+        if let Err(error) = w.set_focusable(false) {
+            focus::cancel();
+            win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
+            return;
+        }
+        let Ok(hwnd) = w.hwnd() else {
+            focus::cancel();
+            win::log_diagnostic("show-main-no-hwnd");
+            return;
+        };
+        NOACTIVATE_VISIBLE.store(true, Ordering::Relaxed);
+        PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
+        WINDOW_VISIBLE.store(true, Ordering::Relaxed);
+        if !win::show_no_activate(hwnd.0 as _) {
+            NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
+            PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+            WINDOW_VISIBLE.store(false, Ordering::Relaxed);
+            focus::cancel();
+            win::log_diagnostic("show-main-noactivate-failed");
+            return;
+        }
+    } else {
+        NOACTIVATE_VISIBLE.store(false, Ordering::Relaxed);
+        PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+        if let Err(e) = w.set_focusable(true) {
+            focus::cancel();
+            win::log_diagnostic(&format!("set-focusable-failed {e}"));
+            return;
+        }
+        let _ = w.unminimize();
+        if let Err(e) = w.show() {
+            win::log_diagnostic(&format!("show-main-failed {e}"));
+            eprintln!("show main window failed: {e}");
+            return;
+        }
+        // show_main already runs on the main thread (dispatched by the hook dispatcher).
+        if let Ok(hwnd) = w.hwnd() {
+            win::force_foreground(hwnd.0 as _);
+        }
+        WINDOW_VISIBLE.store(true, Ordering::Relaxed);
+    }
+    win::log_diagnostic("show-main-complete");
+    let _ = w.emit("window-shown", preserve_editor);
+    if preserve_editor {
+        watch_preserved_editor(app);
+    }
+}
+
+#[cfg(windows)]
+fn watch_preserved_editor(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            if !WINDOW_VISIBLE.load(Ordering::Relaxed)
+                || !PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            if !focus::preserved_editor_active() {
+                // Follow the new destination. If it is another Explorer rename edit, keep
+                // protecting it; otherwise a pinned panel can return to normal interaction.
+                if focus::foreground_changed() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if WINDOW_VISIBLE.load(Ordering::Relaxed)
+                        && PRESERVE_EDITOR_MODE.load(Ordering::Relaxed)
+                        && !focus::preserved_editor_active()
+                    {
+                        let pinned = handle
+                            .try_state::<Core>()
+                            .is_some_and(|core| core.settings().keep_on_blur);
+                        if pinned {
+                            if let Some(window) = main_window(&handle) {
+                                if let Err(error) = window.set_focusable(true) {
+                                    win::log_diagnostic(&format!("set-focusable-failed {error}"));
+                                    return;
+                                }
+                                PRESERVE_EDITOR_MODE.store(false, Ordering::Relaxed);
+                                let _ = window.emit("rename-safe-mode-changed", false);
+                                win::log_diagnostic("preserved-editor-released-pinned");
+                            }
+                        } else {
+                            win::log_diagnostic("preserved-editor-dismissed");
+                            hide_main(&handle);
+                        }
+                    }
+                });
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+}
+
+#[cfg(windows)]
+fn toggle_main(app: &AppHandle) {
+    let visible = WINDOW_VISIBLE.load(Ordering::Relaxed);
+    win::log_diagnostic(&format!("toggle-main visible={}", visible));
+    if visible {
+        dismiss_main(app);
     } else {
         show_main(app);
     }
@@ -1196,6 +1836,7 @@ fn should_keep_open(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(windows))]
 fn on_main_focus_changed(app: &AppHandle, focused: bool) {
     let epoch = FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     let remaining = SUPPRESS_HIDE_UNTIL.load(Ordering::Relaxed) - db::now_ms();
@@ -1238,6 +1879,81 @@ fn on_main_focus_changed(app: &AppHandle, focused: bool) {
     });
 }
 
+#[cfg(windows)]
+fn on_main_focus_changed(app: &AppHandle, focused: bool) {
+    if PRESERVE_EDITOR_MODE.load(Ordering::Relaxed) {
+        return;
+    }
+    let epoch = FOCUS_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    let remaining = SUPPRESS_HIDE_UNTIL.load(Ordering::Relaxed) - db::now_ms();
+    win::log_diagnostic(&format!(
+        "main-focus focused={focused} visible={} hide-delay-ms={remaining}",
+        WINDOW_VISIBLE.load(Ordering::Relaxed)
+    ));
+    if focused
+        || !WINDOW_VISIBLE.load(Ordering::Relaxed)
+        || focus::is_returning()
+        || focus::owns_foreground()
+    {
+        return;
+    }
+    // Keep the destination current while pinned. If the newly focused window is an Explorer
+    // rename edit, make the visible panel nonfocusable instead of dismissing the pinned window.
+    if focus::external_foreground() {
+        let pinned = app
+            .try_state::<Core>()
+            .is_some_and(|core| core.settings().keep_on_blur);
+        if pinned {
+            if focus::foreground_changed() {
+                if let Some(window) = main_window(app) {
+                    if let Err(error) = window.set_focusable(false) {
+                        win::log_diagnostic(&format!("set-nonfocusable-failed {error}"));
+                        hide_main(app);
+                        return;
+                    }
+                    PRESERVE_EDITOR_MODE.store(true, Ordering::Relaxed);
+                    let _ = window.emit("rename-safe-mode-changed", true);
+                    watch_preserved_editor(app);
+                }
+                return;
+            }
+        } else {
+            focus::cancel();
+        }
+    }
+    if !should_keep_open(app) {
+        hide_main(app);
+        return;
+    }
+    // A real blur during the short show/drag grace period used to be discarded forever.
+    // Check again when the grace expires, unless focus or visibility has changed meanwhile.
+    let app = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            if FOCUS_EPOCH.load(Ordering::Relaxed) != epoch {
+                return;
+            }
+            let remaining = SUPPRESS_HIDE_UNTIL.load(Ordering::Relaxed) - db::now_ms();
+            if remaining <= 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(remaining.min(500) as u64));
+        }
+        let target = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if FOCUS_EPOCH.load(Ordering::Relaxed) == epoch
+                && WINDOW_VISIBLE.load(Ordering::Relaxed)
+                && !should_keep_open(&target)
+                && !focus::owns_foreground()
+                && main_window(&target).is_some_and(|window| !window.is_focused().unwrap_or(false))
+            {
+                win::log_diagnostic("deferred-blur-hide");
+                hide_main(&target);
+            }
+        });
+    });
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("clipkeep 剪贴板")
@@ -1256,8 +1972,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
         });
-    if let Some(icon) = app.default_window_icon() {
-        tray = tray.icon(icon.clone());
+    if let Some(icon) = update::tray_icon(app) {
+        tray = tray.icon(icon);
     }
     tray.build(app)?;
     Ok(())
@@ -1333,9 +2049,42 @@ pub fn run() {
                 )).title("历史数据已保留").show(|_| {});
             }
             handle.state::<Core>().lan.restore(&handle);
+            #[cfg(windows)]
+            {
+                if !cfg!(debug_assertions) {
+                    std::thread::spawn(upgrade_autostart_task);
+                    if let Ok(exe) = std::env::current_exe() {
+                        let marker = exe.with_file_name(AUTOSTART_MARKER);
+                        if marker.exists() {
+                            match create_autostart_task() {
+                                Ok(()) => { let _ = std::fs::remove_file(marker); }
+                                Err(error) => eprintln!("enabling autostart failed: {error}"),
+                            }
+                        }
+                    }
+                }
+                if let Some(w) = main_window(&handle) {
+                    if let Ok(hwnd) = w.hwnd() { win::disable_transitions(hwnd.0 as _); }
+                    recover::watch(&handle, &w);
+                    set_low_memory(&w, true);
+                }
+                win::start_foreground_tracking();
+            }
+            if !cfg!(debug_assertions) && settings.check_update_on_start {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(update::STARTUP_DELAY);
+                    if h.state::<Core>().settings().check_update_on_start {
+                        tauri::async_runtime::block_on(update::check(&h, true));
+                    }
+                });
+            }
 
-            let monitor_handle = handle.clone();
-            clipboard::start_monitor(move |captured| on_local_copy(&monitor_handle, captured));
+
+            let captures = start_capture_worker(handle.clone());
+            clipboard::start_monitor(move |captured| {
+                if captures.send(captured).is_err() { eprintln!("capture worker stopped"); }
+            });
 
             #[cfg(windows)]
             let hook_handle = handle.clone();
@@ -1347,7 +2096,10 @@ pub fn run() {
                 }
             });
 
-            if !std::env::args().any(|a| a == AUTOSTART_ARG) {
+            let to_tray = std::env::args().any(|a| a == AUTOSTART_ARG);
+            #[cfg(windows)]
+            let to_tray = recover::resume_in_tray(&handle.state::<Core>().data_dir).unwrap_or(to_tray);
+            if !to_tray {
                 show_main(&handle);
             }
             Ok(())
@@ -1369,6 +2121,9 @@ pub fn run() {
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
+                    #[cfg(windows)]
+                    dismiss_main(window.app_handle());
+                    #[cfg(not(windows))]
                     hide_main(window.app_handle());
                 }
                 WindowEvent::Focused(focused) => {
@@ -1406,6 +2161,14 @@ pub fn run() {
             paste_clip,
             copy_clip,
             hide_window,
+            get_rename_safe_mode,
+            open_release_page,
+            get_update_state,
+            check_update,
+            download_update,
+            cancel_update,
+            install_update,
+            tray_menu_ready,
             hide_tray_menu,
             tray_menu_action,
             start_drag,
@@ -1420,4 +2183,58 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running clipkeep");
+}
+
+#[cfg(test)]
+mod autostart_task_tests {
+    use super::{AUTOSTART_TASK_VERSION, autostart_task_xml, paste_file_name, task_command};
+    use std::path::PathBuf;
+
+    #[test]
+    fn reads_the_command_of_old_and_new_tasks() {
+        let old = r#"<Exec><Command>"C:\Tools\clipkeep.exe"</Command><Arguments>--minimized</Arguments></Exec>"#;
+        assert_eq!(
+            task_command(old),
+            Some(PathBuf::from(r"C:\Tools\clipkeep.exe"))
+        );
+        let new = autostart_task_xml(r"C:\Users\张三\A&B\clipkeep.exe", r"PC\张三");
+        assert_eq!(
+            task_command(&new),
+            Some(PathBuf::from(r"C:\Users\张三\A&B\clipkeep.exe"))
+        );
+        assert_eq!(task_command("<Task/>"), None);
+    }
+
+    #[test]
+    fn names_pasted_pictures_after_their_file_or_the_time() {
+        assert_eq!(paste_file_name(Some("设计稿 v2.jpg")), "设计稿 v2.png");
+        assert_eq!(paste_file_name(Some(r"a<b>:c?.png")), "abc.png");
+        let timed = paste_file_name(None);
+        assert!(timed.starts_with("clipkeep_") && timed.ends_with(".png"));
+        assert!(
+            timed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        );
+        assert!(paste_file_name(Some("CON.png")).starts_with("clipkeep_"));
+        assert!(paste_file_name(Some("...")).starts_with("clipkeep_"));
+    }
+
+    #[test]
+    fn task_runs_on_battery_without_time_limit_for_this_user() {
+        let xml = autostart_task_xml(r"C:\Users\张三\A&B\clipkeep.exe", r"PC\张三");
+        for setting in [
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<Priority>4</Priority>",
+            "<RunLevel>HighestAvailable</RunLevel>",
+            AUTOSTART_TASK_VERSION,
+        ] {
+            assert!(xml.contains(setting), "missing {setting}");
+        }
+        // The logon trigger and the principal both name the user.
+        assert_eq!(xml.matches(r"<UserId>PC\张三</UserId>").count(), 2);
+        assert!(xml.contains(r"<Command>C:\Users\张三\A&amp;B\clipkeep.exe</Command>"));
+    }
 }

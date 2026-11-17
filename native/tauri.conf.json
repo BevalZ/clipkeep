@@ -40,7 +40,7 @@
         "title": "clipkeep 菜单",
         "url": "index.html?tray=1",
         "width": 200,
-        "height": 162,
+        "height": 197,
         "decorations": false,
         "transparent": true,
         "shadow": false,
@@ -81,6 +81,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese"
+        ],
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }

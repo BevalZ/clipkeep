@@ -16,6 +16,8 @@
 
 [与原始仓库的对比及改进建议](UPSTREAM_COMPARISON.md)说明当前 fork 与 Fomovet/clipkeep 的功能差异、待移植修复和验证范围。
 
+最新源码已补齐上游 Windows 焦点恢复、截图兼容、应用内更新、安装自启、WebView2 内存与故障恢复，以及 HEX 色值预览和可选图片文件命名，见 [移植记录与验证](UPSTREAM_INTEGRATION.md)。
+
 ![浅色和深色主界面](assets/screenshots/hero.png)
 
 ---

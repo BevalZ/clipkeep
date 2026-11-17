@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, applyTheme } from "../api";
+import { useUpdate } from "../update";
 import ClipIcon from "./ClipIcon.vue";
 
 const paused = ref(false);
@@ -10,7 +11,34 @@ const autostart = ref(false);
 const hotkey = ref("");
 const busy = ref(false);
 const error = ref("");
+// The menu is rendered only once its state is known, so the switches appear in place instead of
+// animating from their defaults each time the menu opens.
+const loaded = ref(false);
+const { version, state: update, newer } = useUpdate();
 const status = computed(() => paused.value ? "已暂停" : "记录中");
+
+const updateLabel = computed(() => {
+  const s = update.value;
+  switch (s.kind) {
+    case "checking": return "正在检查…";
+    case "upToDate": return "已是最新版";
+    case "downloading": return `正在下载 v${s.version}`;
+    case "ready": return `v${s.version} 已下载，点击安装`;
+    case "available": return `发现新版本 v${s.version}`;
+    case "error": return s.version ? `v${s.version} 下载失败` : "检查失败，点击重试";
+    default: return "检查更新";
+  }
+});
+const updatePercent = computed(() => {
+  const s = update.value;
+  return s.kind === "downloading" && s.total > 0 ? `${Math.floor((s.received / s.total) * 100)}%` : "";
+});
+
+// Checking happens in place; anything that downloads or installs is confirmed in Settings.
+function onUpdate() {
+  if (newer.value) void act("update");
+  else if (update.value.kind !== "checking") void api.checkUpdate();
+}
 const unlisteners: UnlistenFn[] = [];
 
 async function refresh() {
@@ -27,10 +55,12 @@ async function refresh() {
     error.value = "";
   } catch (e) {
     error.value = String(e);
+  } finally {
+    loaded.value = true;
   }
 }
 
-async function act(action: "show" | "pause" | "autostart" | "quit") {
+async function act(action: "show" | "pause" | "autostart" | "quit" | "update") {
   if (busy.value) return;
   busy.value = true;
   error.value = "";
@@ -65,6 +95,9 @@ onMounted(async () => {
     await listen("settings-changed", refresh),
   );
   await refresh();
+  await nextTick();
+  // The window is created on demand and stays hidden until it has something to show.
+  await invoke("tray_menu_ready");
 });
 
 function preventContextMenu(e: MouseEvent) { e.preventDefault(); }
@@ -77,7 +110,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="tray-shell menu-surface">
+  <div v-if="loaded" class="tray-shell menu-surface">
     <header class="menu-label tray-head">
       <strong>clipkeep</strong>
       <span class="tray-status" :class="{ paused }"><i></i>{{ status }}</span>
@@ -99,6 +132,21 @@ onUnmounted(() => {
         <span class="menu-text">开机自启</span>
         <input class="switch tray-switch" type="checkbox" role="switch" :checked="autostart" :disabled="busy" @change="act('autostart')" />
       </label>
+      <div class="menu-divider"></div>
+      <!-- One row in a fixed slot: the result replaces its text instead of adding rows. -->
+      <button
+        class="menu-row tray-update"
+        :class="[update.kind, { newer }]"
+        :disabled="busy || update.kind === 'checking'"
+        :aria-busy="update.kind === 'checking' || update.kind === 'downloading'"
+        @click="onUpdate"
+      >
+        <ClipIcon :name="newer ? 'download' : update.kind === 'upToDate' ? 'check' : 'refresh'" />
+        <span class="menu-text">{{ updateLabel }}</span>
+        <span v-if="updatePercent" class="menu-shortcut">{{ updatePercent }}</span>
+        <span v-else-if="newer" class="update-dot" aria-label="有新版本"></span>
+        <span v-else-if="version" class="menu-shortcut">v{{ version }}</span>
+      </button>
       <div class="menu-divider"></div>
       <button class="menu-row danger" :disabled="busy" @click="act('quit')">
         <ClipIcon name="close" />
@@ -127,6 +175,27 @@ onUnmounted(() => {
 .tray-switch::after { width: 14px; height: 14px; }
 .tray-switch:checked::after { transform: translateX(14px); }
 .tray-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tray-update.checking:disabled { opacity: 1; cursor: progress; }
+.tray-update.checking:disabled:hover { background: none; color: var(--text); }
+.tray-update.checking > svg { animation: tray-spin 0.9s linear infinite; }
+.tray-update.upToDate > svg { color: var(--ok); }
+.tray-update.newer,
+.tray-update.newer > svg { color: var(--accent); }
+.tray-update.error:not(.newer),
+.tray-update.error:not(.newer) > svg { color: var(--danger); }
+/* Same red as the dot painted on the tray icon. */
+.update-dot {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: #e5484d;
+}
+@keyframes tray-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .tray-update.checking > svg { animation: none; }
+}
 .tray-error {
   position: absolute;
   inset: auto 5px 5px;

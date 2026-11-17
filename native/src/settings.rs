@@ -26,6 +26,8 @@ pub struct Settings {
     /// Auto-trim loose history over this many MB (0 = unlimited). Favorites/pinned/grouped excluded.
     pub max_storage_mb: u64,
     pub theme: Theme,
+    pub check_update_on_start: bool,
+    pub paste_image_as_file: bool,
 }
 
 /// Only user-editable fields cross IPC; omitted fields keep their current values.
@@ -39,6 +41,8 @@ pub struct SettingsPatch {
     keep_on_blur: Option<bool>,
     max_storage_mb: Option<u64>,
     theme: Option<Theme>,
+    check_update_on_start: Option<bool>,
+    paste_image_as_file: Option<bool>,
 }
 
 impl SettingsPatch {
@@ -51,6 +55,12 @@ impl SettingsPatch {
             keep_on_blur: self.keep_on_blur.unwrap_or(current.keep_on_blur),
             max_storage_mb: self.max_storage_mb.unwrap_or(current.max_storage_mb),
             theme: self.theme.unwrap_or(current.theme),
+            check_update_on_start: self
+                .check_update_on_start
+                .unwrap_or(current.check_update_on_start),
+            paste_image_as_file: self
+                .paste_image_as_file
+                .unwrap_or(current.paste_image_as_file),
             ..current.clone()
         }
     }
@@ -73,6 +83,8 @@ impl Default for Settings {
             window_y: None,
             max_storage_mb: 500,
             theme: Theme::System,
+            check_update_on_start: true,
+            paste_image_as_file: false,
         }
     }
 }

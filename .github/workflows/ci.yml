@@ -8,6 +8,40 @@ permissions:
   contents: read
 
 jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: npm --prefix ui ci
+      - run: python -m pip install playwright==1.65.2
+      - run: python -m playwright install --with-deps chromium
+      - name: Check clipboard interactions and updates
+        run: |
+          npm --prefix ui run dev -- --host 127.0.0.1 > /tmp/clipkeep-vite.log 2>&1 &
+          vite_pid=$!
+          trap 'kill "$vite_pid"' EXIT
+          python - <<'PY'
+          import time, urllib.request
+          for attempt in range(30):
+              try:
+                  urllib.request.urlopen('http://127.0.0.1:1420/', timeout=1).close()
+                  break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit('Vite did not start')
+          PY
+          python ui/tests/focus_ipc_smoke.py
+          python ui/tests/upstream_smoke.py
+
   windows:
     runs-on: windows-latest
     steps:
