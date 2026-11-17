@@ -1,4 +1,4 @@
-## 未发布
+## clipkeep v0.5.0
 
 本版本基于 [Fomovet/clipkeep](https://github.com/Fomovet/clipkeep) 二次开发，由 [BevalZ/clipkeep](https://github.com/BevalZ/clipkeep) 发布，包含原生 Android、跨端图片互传及本 fork 的存储与可靠性改进。
 
@@ -9,7 +9,7 @@
 - 桌面损坏数据库连同 WAL、原图和缩略图归档保留，未完成的恢复可续做；图片写入至入库完成期间受到保护。容量不足时回滚保存，避免误报成功；修复输入法快捷键和设置并发保存。
 - Android 图片分享 URI 绑定记录与内容，避免记录 ID 复用后访问到其他图片。
 - README 重写并在开头明确上游来源，补充平台差异、使用步骤和验证范围。
-- 改动与验证范围见 [上游移植记录](UPSTREAM_INTEGRATION.md)。
+- 改动与验证范围见 [上游移植记录](https://github.com/BevalZ/clipkeep/blob/v0.5.0/UPSTREAM_INTEGRATION.md)。
 
 ### 升级说明
 

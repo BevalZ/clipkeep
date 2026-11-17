@@ -1,4 +1,4 @@
-# clipkeep Android 0.4.2
+# clipkeep Android 0.5.0
 
 Android 9（API 28）及以上。原生 Java、系统控件、SQLite，无 WebView 和生产环境第三方依赖。支持文本/图片历史、搜索、收藏、置顶、系统分享、图片选择、复制与局域网加密互传。
 
